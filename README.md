@@ -17,8 +17,8 @@ Proxy **不做 Anthropic ↔ OpenAI 格式轉換**。只有精確的 `POST /v1/m
 
 - 每個 request 有獨立 `RequestContext`、AbortController、SSE parser、Tool Call map、writer、heartbeat 與 recovery 狀態。
 - Claude Code 與 Proxy 之間以 SSE comment／Anthropic `ping` 維持連線。
-- Thinking block 在 Proxy 內緩衝；同一 Thinking block 發生循環時，保留循環前內容與第一份循環，刪除後續重複，再執行一次 Recovery。
-- 第一輪失敗產生的 text 與 tool calls 不會送到 Claude Code。
+- Thinking block 在 Proxy 內緩衝；同一 Thinking block 發生循環時，整份失敗 Attempt 都不進入正式 transcript，Proxy 只輸出完整 Recovery Attempt。
+- 第一輪失敗產生的 Thinking、text 與 tool calls 都不會送到 Claude Code，也不會被當成任務進度。
 - `tool_use` 的 `partial_json` 必須完整累積並通過 `JSON.parse`，才以一筆完整 `input_json_delta` 輸出。
 - Edit／Update 若 `old_string === new_string`，或完全重送一個已失敗的 Edit，會在送往 Claude Code 前被拒絕並進入 Read-first 修復。
 - 意外截斷時整份第一次 generation 丟棄；最多 Recovery 一次。
@@ -135,7 +135,7 @@ seed
 ```text
 已有較新的成功 Fetch Result
 → 不再強制搜尋或讀取
-→ 只加入保留進度的 evidence-available prompt
+→ 只加入 evidence-authority 的 evidence-available prompt
 
 已有帶 HTTP(S) URL 的成功 Search Result
 → 建立 Fetch 候選集合
@@ -195,7 +195,7 @@ Recovery request 同時會：
 
 - 保留 Claude Code 傳入的 model 原值。
 - 使用較緊的 `temperature <= 0.30` 與 `max_tokens <= 1024`。
-- 附加 Ornith 專用短 prompt：既有任務狀態與完成進度仍具權威，不得重新開始、重新規劃、重新劃定範圍、撤銷或替換已完成工作。
+- 附加統一 Recovery Boundary：以 observed workspace artifacts、accepted Tool Results 與 verified outcomes 作為 continuity baseline；failed narration、partial reasoning 與未執行 Tool Call 不構成進度。
 - 禁止分析文字、結論、Final Response 與完成宣告；可執行輸出只能是一個完整的允許網路 Tool Call。
 - 不建立 `Active Outcome`，也不重新摘要原始任務。
 
@@ -233,7 +233,7 @@ old_string === new_string
 → 要求 old_string 依目前檔案內容重建，且 new_string 必須不同
 ```
 
-Recovery Tool Call 仍需通過「恰好一個允許工具、無 Final Text、`stop_reason=tool_use`」硬驗證。若沒有可辨識的本地 Read 工具，Proxy 會直接要求原 Edit 工具產生修正後的非 no-op 參數；第二輪仍無效則以 Anthropic SSE error 結束，不執行錯誤修改。
+Recovery Tool Call 仍需通過「恰好一個允許工具、無 Final Text、`stop_reason=tool_use`」硬驗證。Read repair 的 `file_path` 必須精確等於 rejected edit target；Edit repair 必須使用原工具與同一 target file，且不得把原本非 `replace_all` 的修改擴大成 `replace_all`。若沒有可辨識的本地 Read 工具，Proxy 會直接要求原 Edit 工具產生修正後的非 no-op 參數；第二輪仍無效則以 Anthropic SSE error 結束，不執行錯誤修改。
 
 ### Loop 偵測補強
 
@@ -243,13 +243,14 @@ Loop detector 會正規化大小寫、標點、空白與終端自動換行，並
 
 普通兩空白終端縮排不再被視為程式碼。只有 fenced code、強程式語法比例或明顯 log 記錄會排除候選重複區段；排除只作用於候選區段，不會因 Thinking 其他位置曾出現 code fence 就跳過整個 block。
 
-### Loop 內容保留
+### Loop Recovery transcript boundary
 
 ```text
-保留：Loop 前內容 + 第一份循環
-丟棄：第二份及後續重複、第一輪 text、第一輪 tool_use
-最終：整理後 Thinking + Recovery Thinking + Recovery Tool Call
+第一輪失敗 Attempt：Thinking、text、tool_use 全部丟棄
+正式輸出：只包含完整 Recovery Thinking／Text／Tool Call
 ```
+
+Loop detector 的 `retainEnd` 只用於判斷與診斷，不再把第一輪推理重新注入 Claude Code transcript。這避免 failed narration 在下一回合被 Ornith 誤認成 continuity state 或重新規劃依據。
 
 ### 意外截斷、SSE 或 Tool Call 結構錯誤
 

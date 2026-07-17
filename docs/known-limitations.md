@@ -8,13 +8,13 @@ The proxy requires the upstream vLLM deployment to expose compatible `/v1/messag
 
 Assistant content is intentionally delayed until one attempt is structurally complete. Heartbeats remain live, but Thinking, Text, and Tool Calls are not delivered token-by-token.
 
-## Usage accounting after Loop Recovery
+## Recovery usage accounting
 
-When retained Thinking from attempt 1 is merged with attempt 2, upstream token usage cannot exactly describe the synthetic output. The proxy preserves upstream usage metadata but does not claim exact billing-grade accounting for the merged Thinking.
+The downstream transcript contains only the successful Recovery attempt, so no synthetic Thinking merge is performed. However, vLLM still consumed compute and tokens for the discarded first attempt. The serialized Anthropic usage reflects the Recovery response and is not an aggregate operational-cost counter for both attempts.
 
-## Thinking signature
+## Thinking signature after re-serialization
 
-A merged Thinking block cannot reuse either upstream signature. The proxy emits a new opaque UUID-style signature. This follows vLLM-compatible behavior but is not a cryptographic attestation of the modified Thinking.
+Buffered Thinking blocks are re-serialized with a proxy-generated opaque UUID-style signature. This is transport compatibility metadata, not cryptographic attestation of the model's reasoning.
 
 ## Tool schema validation
 
@@ -42,7 +42,7 @@ If Claude Code omits a tool from `tools[]`, permission policy denies it, vLLM ca
 
 The URL detector intentionally does not parse arbitrary user prose, relative links, browser state, or vendor-specific nested result schemas beyond their serialized text. A relevant URL supplied directly by the user may therefore not trigger fetch-first recovery.
 
-The progress-preservation prompt constrains the recovery generation. After the real Tool Result returns in a later Claude Code request, normal model behavior resumes; the proxy cannot guarantee that the model will never reconsider prior work. Existing runtime policies and tests should still enforce decision preservation and evidence-gated changes.
+The evidence-authority Recovery Boundary constrains only the recovery generation. After the real Tool Result returns in a later Claude Code request, normal model behavior resumes; the proxy cannot guarantee that the model will never reconsider prior work. Existing runtime policies and tests should still enforce decision preservation, verified-outcome closure, and evidence-gated changes.
 
 Network recovery rejects non-empty Text output, zero or multiple Tool Calls, names outside the allowed candidate set, and a non-`tool_use` stop reason, but it does not reject valid Thinking blocks. Some reasoning models emit Thinking even when a Tool Call is required; rejecting all Thinking would make recovery brittle. The prompt, 1024-token default cap, Loop detector, and single-recovery limit constrain this behavior but cannot prove the model did not internally reconsider prior hypotheses.
 
@@ -50,7 +50,7 @@ Network recovery rejects non-empty Text output, zero or multiple Tool Calls, nam
 
 ## Edit semantic validation is deliberately narrow
 
-The Edit guard rejects only exact `old_string === new_string` and exact canonical replay of an Edit-like Tool Call already paired with `is_error:true`. It does not read the filesystem itself, prove that `old_string` exists, validate file encodings, interpret patches, or determine whether a different replacement is logically correct. Read-first recovery depends on a current request tool that can be conservatively recognized as a local file reader. Non-streaming `/v1/messages` responses are forwarded without buffered Tool Call semantic inspection.
+The Edit guard rejects exact `old_string === new_string`, exact canonical replay of an Edit-like Tool Call already paired with `is_error:true`, Read-repair target changes, Edit-repair target changes, and unauthorized `replace_all` expansion. It still does not read the filesystem itself, prove that `old_string` exists, validate file encodings, interpret patches, or determine whether a different replacement is logically correct. Read-first recovery depends on a current request tool that can be conservatively recognized as a local file reader. Non-streaming `/v1/messages` responses are forwarded without buffered Tool Call semantic inspection.
 
 ## Loop detection remains heuristic
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0 - 2026-07-18
+
+- Replaced per-mode task-state language with one evidence-authority Recovery Boundary based on observed workspace artifacts, accepted Tool Results, and verified outcomes.
+- Declared buffered failed generations to have produced no executed task-state change and prohibited Recovery from creating a new task, phase, plan, baseline, project structure, or authorization.
+- Stopped merging any failed-attempt Thinking into the successful Recovery transcript; the downstream response now contains only the complete Recovery attempt.
+- Locked Edit-repair Read calls to the rejected edit's exact `file_path`.
+- Locked corrected Edit／Update calls to the original tool and exact target file, and rejected `replace_all` expansion unless the rejected edit already used it.
+- Added end-to-end fail-closed tests for wrong Read targets, wrong Edit targets, mutation-boundary widening, and failed-Thinking transcript exclusion.
+
 ## 0.6.0 - 2026-07-18
 
 - Added schema-based no-op Edit／Update rejection when `old_string` and `new_string` are exactly identical.

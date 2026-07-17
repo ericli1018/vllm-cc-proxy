@@ -192,6 +192,7 @@ function editToolInfo(block) {
     filePath: typeof block.input.file_path === 'string' ? block.input.file_path : '',
     oldString,
     newString,
+    replaceAll: block.input.replace_all === true || block.input.replaceAll === true,
     fingerprint: toolCallFingerprint(block.name, block.input),
   };
 }
@@ -368,63 +369,59 @@ function inspectNetworkToolHistory(input, config) {
   return { latestSearch, latestFetch };
 }
 
+function recoveryBoundaryLines(label = '[RECOVERY BOUNDARY]') {
+  return [
+    label,
+    'The failed generation produced no executed task-state change.',
+    'This recovery does not create a new task, phase, plan, baseline, project structure, or authorization.',
+    'Continue from the evidence-supported state already established by observed workspace artifacts, accepted tool results, and verified outcomes.',
+    'A verified-complete outcome remains closed unless new direct evidence invalidates its completion evidence.',
+    'Correct only the affected boundary. Do not rebuild Task State, recreate completed setup, reopen unrelated work, or repeat an unchanged failed action.',
+    'Failed narration, partial reasoning, and unexecuted tool calls are not progress or state evidence.',
+  ];
+}
+
 function buildForcedNetworkInstruction(reason, selectedTool) {
   return [
-    '[RECOVERY CONTROL]',
-    'This is a recovery generation for the current assistant turn.',
-    'The task state established before the failed generation remains authoritative.',
-    'Preserve all existing progress.',
-    'Do not restart, re-plan, re-scope, undo, replace, or reconsider completed work.',
+    ...recoveryBoundaryLines(),
     'Only the unresolved blocker that caused the reasoning loop is open.',
     `Recovery reason: ${reason}.`,
     `Required tool: ${selectedTool}.`,
     `Emit exactly one complete call to ${selectedTool} to obtain missing current external evidence for that blocker.`,
     'Do not emit analysis, planning, explanation, conclusions, final text, completion claims, or any other tool call.',
-    'Do not change existing task state before the real tool result is returned.',
+    'Do not change evidence-supported task state before the real tool result is returned.',
   ].join('\n');
 }
 
 function buildChoiceNetworkInstruction(reason, allowedTools) {
   return [
-    '[RECOVERY CONTROL]',
-    'This is a recovery generation for the current assistant turn.',
-    'The task state established before the failed generation remains authoritative.',
-    'Preserve all existing progress.',
-    'Do not restart, re-plan, re-scope, undo, replace, or reconsider completed work.',
+    ...recoveryBoundaryLines(),
     'Only the unresolved blocker that caused the reasoning loop is open.',
     `Recovery reason: ${reason}.`,
     `Allowed network tools: ${allowedTools.join(', ')}.`,
     'Choose exactly one allowed network tool that can obtain the missing current external evidence for that blocker.',
     'Emit exactly one complete Tool Call. Do not call any tool outside the allowed set.',
     'Do not emit analysis, planning, explanation, conclusions, final text, or completion claims.',
-    'Do not change existing task state before the real tool result is returned.',
+    'Do not change evidence-supported task state before the real tool result is returned.',
   ].join('\n');
 }
 
 function buildEvidenceAvailableInstruction(reason) {
   return [
-    '[RECOVERY CONTROL]',
-    'This is a recovery generation for the current assistant turn.',
-    'The task state established before the failed generation remains authoritative.',
-    'Preserve all existing progress.',
-    'Do not restart, re-plan, re-scope, undo, replace, or reconsider completed work.',
+    ...recoveryBoundaryLines(),
     'A completed configured source-retrieval result is present in the request messages.',
     'Treat that result as evidence input, not a verified conclusion.',
     'Use it only to resolve the blocker that caused the reasoning loop, then take the smallest next necessary action.',
     'Do not repeat network search or source retrieval merely because recovery was triggered.',
     'Do not treat source retrieval as completion of research or completion of the task.',
-    'Do not reopen completed work unless new direct evidence specifically contradicts an unverified provisional assumption.',
+    'Do not reopen a verified-complete outcome unless the new direct evidence invalidates its completion evidence.',
     `Recovery reason: ${reason}.`,
   ].join('\n');
 }
 
 function buildEvidenceFallbackInstruction(reason) {
   return [
-    '[RECOVERY CONTROL]',
-    'This is a recovery generation for the current assistant turn.',
-    'The task state established before the failed generation remains authoritative.',
-    'Preserve all existing progress.',
-    'Do not restart, re-plan, re-scope, undo, replace, or reconsider completed work.',
+    ...recoveryBoundaryLines(),
     'No approved network tool is available in the current request. Do not invent a network tool or external evidence.',
     'Use the smallest available evidence-producing action for only the unresolved blocker.',
     'If no available tool can produce new evidence, identify the exact missing evidence without guessing or claiming completion.',
@@ -434,12 +431,10 @@ function buildEvidenceFallbackInstruction(reason) {
 
 function buildGenericRecoveryInstruction(reason) {
   return [
-    '[RECOVERY CONTROL]',
+    ...recoveryBoundaryLines(),
     'The previous generation was incomplete or structurally invalid.',
-    'The task state established before that failed generation remains authoritative.',
-    'Preserve all completed progress and existing tool results.',
-    'Do not assume that partial text or partial tool calls from the failed generation were executed.',
-    'Regenerate only the current assistant turn without restarting, re-planning, re-scoping, undoing, or replacing completed work.',
+    'Regenerate only the current assistant turn from the same evidence-supported state.',
+    'Do not create or revise a task plan merely because transport, parsing, or generation failed.',
     `Recovery reason: ${reason}.`,
   ].join('\n');
 }
@@ -450,16 +445,13 @@ function buildEditRepairReadInstruction(reason, rejectedEdit, readTool) {
     ? 'The rejected edit was invalid because old_string and new_string were identical, so it could not change the file.'
     : 'The same edit already failed and must not be submitted again unchanged.';
   return [
-    '[RECOVERY CONTROL: EDIT REPAIR]',
-    'This is a recovery generation for the current assistant turn.',
-    'The task state established before the rejected edit remains authoritative.',
-    'Preserve all existing progress. Do not restart, re-plan, re-scope, undo, replace, or repeat completed work.',
+    ...recoveryBoundaryLines('[RECOVERY BOUNDARY: EDIT REPAIR]'),
     failure,
     `Rejected edit tool: ${rejectedEdit?.name || 'unknown'}.`,
-    `Target file: ${target}.`,
+    `Locked target file: ${target}.`,
     `Required tool: ${readTool}.`,
-    `Emit exactly one complete ${readTool} Tool Call for ${target}.`,
-    'Do not emit an Edit or Update call in this recovery generation.',
+    `Emit exactly one complete ${readTool} Tool Call for the locked target file ${target}.`,
+    'Do not read a different file. Do not emit an Edit or Update call in this recovery generation.',
     'Do not emit analysis, planning, explanation, conclusions, final text, or completion claims.',
     'After the real file content is returned in the next request, construct a minimal edit whose old_string matches the current file and whose new_string is different.',
     `Recovery reason: ${reason}.`,
@@ -469,17 +461,17 @@ function buildEditRepairReadInstruction(reason, rejectedEdit, readTool) {
 function buildEditRepairRetryInstruction(reason, rejectedEdit) {
   const target = rejectedEdit?.filePath || 'the original target file';
   return [
-    '[RECOVERY CONTROL: EDIT REPAIR]',
-    'This is a recovery generation for the current assistant turn.',
-    'The task state established before the rejected edit remains authoritative.',
-    'Preserve all existing progress. Do not restart, re-plan, re-scope, undo, replace, or repeat completed work.',
+    ...recoveryBoundaryLines('[RECOVERY BOUNDARY: EDIT REPAIR]'),
     reason === 'no_op_edit_tool_call'
       ? 'The rejected edit was invalid because old_string and new_string were identical, so it could not change the file.'
       : 'The same edit already failed and must not be submitted again unchanged.',
-    `Target file: ${target}.`,
+    `Locked target file: ${target}.`,
     `Required tool: ${rejectedEdit?.name || 'the original edit tool'}.`,
-    'Emit exactly one complete corrected edit Tool Call.',
+    'Emit exactly one complete corrected edit Tool Call for the locked target file.',
     'The corrected old_string must match the current file content and new_string must be different from old_string.',
+    rejectedEdit?.replaceAll
+      ? 'The rejected edit already authorized replace_all semantics; do not broaden the mutation beyond that existing boundary.'
+      : 'Do not enable replace_all or otherwise widen the mutation boundary.',
     'Do not repeat the rejected arguments. Do not emit analysis, explanation, final text, or completion claims.',
     `Recovery reason: ${reason}.`,
   ].join('\n');
@@ -494,6 +486,9 @@ function buildEditRepairPlan(input, reason, failedResult) {
       mode: 'edit_repair_read',
       selectedTool: readTool.name,
       allowedTools: [readTool.name],
+      targetFilePath: rejectedEdit?.filePath || '',
+      rejectedEditName: rejectedEdit?.name || '',
+      allowReplaceAll: rejectedEdit?.replaceAll === true,
       instruction: buildEditRepairReadInstruction(reason, rejectedEdit, readTool.name),
     };
   }
@@ -506,6 +501,9 @@ function buildEditRepairPlan(input, reason, failedResult) {
       mode: 'edit_repair_retry',
       selectedTool: rejectedTool.name,
       allowedTools: [rejectedTool.name],
+      targetFilePath: rejectedEdit?.filePath || '',
+      rejectedEditName: rejectedEdit?.name || '',
+      allowReplaceAll: rejectedEdit?.replaceAll === true,
       instruction: buildEditRepairRetryInstruction(reason, rejectedEdit),
     };
   }
@@ -627,8 +625,27 @@ function validateRecoveryContract(result, recoveryPlan) {
     return { ok: false, reason: 'network_recovery_tool_not_allowed' };
   }
   if (recoveryPlan?.selectedTool && toolBlocks[0].name !== recoveryPlan.selectedTool) {
-    return { ok: false, reason: 'forced_network_tool_name_mismatch' };
+    return { ok: false, reason: 'forced_recovery_tool_name_mismatch' };
   }
+
+  const recoveryTool = toolBlocks[0];
+  if (recoveryPlan?.mode === 'edit_repair_read') {
+    const actualPath = typeof recoveryTool.input?.file_path === 'string' ? recoveryTool.input.file_path : '';
+    if (!recoveryPlan.targetFilePath || actualPath !== recoveryPlan.targetFilePath) {
+      return { ok: false, reason: 'edit_repair_read_target_mismatch' };
+    }
+  }
+  if (recoveryPlan?.mode === 'edit_repair_retry') {
+    const editInfo = editToolInfo(recoveryTool);
+    if (!editInfo) return { ok: false, reason: 'edit_repair_invalid_arguments' };
+    if (!recoveryPlan.targetFilePath || editInfo.filePath !== recoveryPlan.targetFilePath) {
+      return { ok: false, reason: 'edit_repair_target_mismatch' };
+    }
+    if (!recoveryPlan.allowReplaceAll && editInfo.replaceAll) {
+      return { ok: false, reason: 'edit_repair_replace_all_expansion' };
+    }
+  }
+
   const hasText = blocks.some((block) => block.type === 'text' && String(block.text || '').trim());
   if (hasText) return { ok: false, reason: 'network_recovery_emitted_text' };
   if (result.stopReason !== 'tool_use') {
@@ -1451,58 +1468,8 @@ export function detectThinkingLoop(text, config = loadConfig({})) {
   return null;
 }
 
-export function mergeRecovery(firstAttempt, recoveryAttempt, loopInfo) {
-  if (!loopInfo) return structuredClone(recoveryAttempt);
-
-  const firstThinkingIndex = Number.isInteger(loopInfo.blockIndex)
-    ? loopInfo.blockIndex
-    : firstAttempt.blocks.findIndex((block) => block.type === 'thinking');
-  const firstThinking = firstAttempt.blocks[firstThinkingIndex];
-  const retained = firstThinking?.type === 'thinking'
-    ? firstThinking.thinking.slice(0, loopInfo.retainEnd)
-    : '';
-  const recoveryThinking = recoveryAttempt.blocks
-    .filter((block) => block.type === 'thinking')
-    .map((block) => block.thinking)
-    .filter(Boolean)
-    .join('\n\n');
-  const mergedThinking = retained && recoveryThinking
-    ? `${retained}\n\n${recoveryThinking}`
-    : (retained || recoveryThinking);
-
-  const blocks = [];
-  if (mergedThinking) {
-    blocks.push({
-      upstreamIndex: 0,
-      type: 'thinking',
-      start: { type: 'thinking', thinking: '' },
-      stopped: true,
-      thinking: mergedThinking,
-      signature: null,
-      text: '',
-      id: null,
-      name: null,
-      partialJson: '',
-      input: null,
-      toolJsonError: null,
-      rawDeltas: [],
-    });
-  }
-
-  for (const block of recoveryAttempt.blocks) {
-    if (block.type === 'thinking') continue;
-    const clone = structuredClone(block);
-    clone.upstreamIndex = blocks.length;
-    blocks.push(clone);
-  }
-
-  return {
-    ...structuredClone(recoveryAttempt),
-    blocks,
-    bytes: Number(firstAttempt.bytes || 0) + Number(recoveryAttempt.bytes || 0),
-    structuralErrors: [],
-    errorEvent: null,
-  };
+export function mergeRecovery(_firstAttempt, recoveryAttempt, _loopInfo) {
+  return structuredClone(recoveryAttempt);
 }
 
 

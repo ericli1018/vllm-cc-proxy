@@ -422,8 +422,8 @@ test('selectRecoveryPlan prefers configured MCP search over built-in WebSearch a
 
   assert.equal(plan.mode, 'network_search');
   assert.equal(plan.selectedTool, 'mcp__searxng__search');
-  assert.match(plan.instruction, /Preserve all existing progress/i);
-  assert.match(plan.instruction, /Do not restart, re-plan, re-scope, undo, replace, or reconsider completed work/i);
+  assert.match(plan.instruction, /evidence-supported state/i);
+  assert.match(plan.instruction, /does not create a new task, phase, plan, baseline, project structure, or authorization/i);
   assert.match(plan.instruction, /exactly one complete call/i);
   assert.doesNotMatch(plan.instruction, /Active Outcome/i);
   assert.doesNotMatch(plan.instruction, /complete the original user request/i);
@@ -584,7 +584,7 @@ test('applyRequestPolicy applies forced network recovery tool choice and tighter
   const plan = {
     mode: 'network_search',
     selectedTool: 'WebSearch',
-    instruction: '[RECOVERY CONTROL] Preserve all existing progress.',
+    instruction: '[RECOVERY CONTROL] Continue from the evidence-supported state.',
   };
 
   const output = applyRequestPolicy(input, config, { recoveryPlan: plan });
@@ -593,7 +593,7 @@ test('applyRequestPolicy applies forced network recovery tool choice and tighter
   assert.equal(output.temperature, 0.3);
   assert.equal(output.max_tokens, 1024);
   assert.deepEqual(output.tool_choice, { type: 'tool', name: 'WebSearch' });
-  assert.match(JSON.stringify(output.system), /Preserve all existing progress/);
+  assert.match(JSON.stringify(output.system), /evidence-supported state/);
 });
 
 

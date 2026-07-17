@@ -199,7 +199,7 @@ test('still exempts strongly code-like indented repeated regions', () => {
   assert.equal(detectThinkingLoop(code, config({ LOOP_MAX_PATTERN_SIZE: '512' })), null);
 });
 
-test('mergeRecovery keeps retained first thinking, appends recovery thinking, and discards first output and tools', () => {
+test('mergeRecovery discards all failed-attempt thinking and returns only the complete recovery attempt', () => {
   const firstText = 'Prefix.\nCycle action.\nCycle action.\n';
   const loop = detectThinkingLoop(firstText, config());
   const first = attempt({
@@ -218,10 +218,11 @@ test('mergeRecovery keeps retained first thinking, appends recovery thinking, an
 
   assert.equal(merged.stopReason, 'tool_use');
   assert.equal(merged.blocks[0].type, 'thinking');
-  assert.match(merged.blocks[0].thinking, /^Prefix\.\nCycle action\./);
-  assert.match(merged.blocks[0].thinking, /Recovery selects a concrete action\./);
+  assert.equal(merged.blocks[0].thinking, 'Recovery selects a concrete action.');
+  assert.equal(merged.blocks.some((block) => String(block.thinking || '').includes('Prefix.')), false);
   assert.equal(merged.blocks.some((block) => block.text === 'discard this text'), false);
   assert.deepEqual(merged.blocks.filter((block) => block.type === 'tool_use').map((block) => block.id), ['toolu_new']);
+  assert.equal(merged.bytes, second.bytes);
 });
 
 test('mergeRecovery returns only the complete recovery attempt for accidental truncation', () => {
