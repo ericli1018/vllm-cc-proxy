@@ -73,9 +73,6 @@ export function loadConfig(env = process.env) {
     vllmApiKey: env.VLLM_API_KEY || 'vllm',
     proxyApiKey: env.PROXY_API_KEY || '',
     samplingDefaults: Object.freeze({
-      temperature: parseNumber(env.DEFAULT_TEMPERATURE, 0.65, { min: 0, max: 2 }),
-      top_p: parseNumber(env.DEFAULT_TOP_P, 0.9, { min: 0, max: 1 }),
-      top_k: parseInteger(env.DEFAULT_TOP_K, 40, { min: 0, max: 100000 }),
       max_tokens: parseInteger(env.DEFAULT_MAX_TOKENS, 8192, { min: 1 }),
     }),
     defaultEnableThinking: parseBoolean(env.DEFAULT_ENABLE_THINKING, true),
@@ -108,7 +105,7 @@ export function loadConfig(env = process.env) {
     recoveryTimeoutMs: parseInteger(env.RECOVERY_TIMEOUT_MS, 900000, { min: 1000 }),
     shutdownGraceMs: parseInteger(env.SHUTDOWN_GRACE_MS, 300000, { min: 1000 }),
     loopMinPatternSize: parseInteger(env.LOOP_MIN_PATTERN_SIZE, 24, { min: 4 }),
-    loopMaxPatternSize: parseInteger(env.LOOP_MAX_PATTERN_SIZE, 384, { min: 8 }),
+    loopMaxPatternSize: parseInteger(env.LOOP_MAX_PATTERN_SIZE, 2048, { min: 8 }),
     loopMinCount: parseInteger(env.LOOP_MIN_COUNT, 2, { min: 2 }),
     loopReasoningCharLimit: parseInteger(env.LOOP_REASONING_CHAR_LIMIT, 24000, { min: 128 }),
     loopScanIntervalChars: parseInteger(env.LOOP_SCAN_INTERVAL_CHARS, 64, { min: 8 }),
@@ -490,13 +487,23 @@ export function applyRequestPolicy(input, config, { recoveryReason = null, recov
     const number = Number(value);
     return Number.isSafeInteger(number) && number >= min && number <= max ? number : fallback;
   };
-  const validatedSampling = {
-    temperature: parseNumber(body.temperature, config.samplingDefaults.temperature, { min: 0, max: 2 }),
-    top_p: parseNumber(body.top_p, config.samplingDefaults.top_p, { min: 0, max: 1 }),
-    top_k: strictInteger(body.top_k, config.samplingDefaults.top_k, { min: 0, max: 100000 }),
-    max_tokens: strictInteger(body.max_tokens, config.samplingDefaults.max_tokens, { min: 1 }),
+  const validateOptionalNumber = (key, options) => {
+    if (!Object.hasOwn(body, key)) return;
+    const value = parseNumber(body[key], undefined, options);
+    if (value === undefined) delete body[key];
+    else body[key] = value;
   };
-  Object.assign(body, validatedSampling);
+  const validateOptionalInteger = (key, options) => {
+    if (!Object.hasOwn(body, key)) return;
+    const value = strictInteger(body[key], undefined, options);
+    if (value === undefined) delete body[key];
+    else body[key] = value;
+  };
+
+  validateOptionalNumber('temperature', { min: 0, max: 2 });
+  validateOptionalNumber('top_p', { min: 0, max: 1 });
+  validateOptionalInteger('top_k', { min: 0, max: 100000 });
+  body.max_tokens = strictInteger(body.max_tokens, config.samplingDefaults.max_tokens, { min: 1 });
 
   const effectiveRecoveryPlan = recoveryPlan || (recoveryReason
     ? {
@@ -524,8 +531,10 @@ export function applyRequestPolicy(input, config, { recoveryReason = null, recov
     const maxTokens = isNetworkRecovery
       ? config.recoveryNetworkMaxTokens
       : config.recoveryMaxTokens;
-    body.temperature = Math.min(Number(body.temperature), temperatureMax);
-    body.max_tokens = Math.min(Number(body.max_tokens), maxTokens);
+    body.temperature = Object.hasOwn(body, 'temperature')
+      ? Math.min(body.temperature, temperatureMax)
+      : temperatureMax;
+    body.max_tokens = Math.min(body.max_tokens, maxTokens);
     body.system = appendSystemInstruction(body.system, effectiveRecoveryPlan.instruction);
 
     if (isNetworkRecovery) {
@@ -987,6 +996,12 @@ function extractLines(text) {
   return lines;
 }
 
+function rangeIntersectsFencedCode(text, start, end) {
+  const before = text.slice(0, start).match(/```/g)?.length || 0;
+  if (before % 2 === 1) return true;
+  return text.slice(start, end).includes('```');
+}
+
 function looksLikeCodeOrLogs(text) {
   if (text.includes('```')) return true;
   const lines = text.split(/\r?\n/).filter((line) => line.trim());
@@ -996,12 +1011,16 @@ function looksLikeCodeOrLogs(text) {
     || /^\s*\[[A-Z]+\]/.test(line)
     || /\b(?:INFO|DEBUG|WARN|ERROR)\b/.test(line)
   )).length;
-  const codeLike = lines.filter((line) => (
-    /^\s{2,}\S/.test(line)
-    || /^\s*(?:const|let|var|function|class|if|for|while|return|import|export)\b/.test(line)
-    || /[{};]\s*$/.test(line)
+  const strongCodeLike = lines.filter((line) => (
+    /^\s*(?:const|let|var|function|class|if|else|for|while|switch|case|return|import|export|typedef|struct|enum|#include)\b/.test(line)
+    || /(?:[{};]\s*$|=>|::|:=)/.test(line)
+    || /^\s*[A-Za-z_$][\w$]*\s*=/.test(line)
   )).length;
-  return logLike / lines.length >= 0.6 || codeLike / lines.length >= 0.7;
+  const indentedSyntaxLike = lines.filter((line) => (
+    /^\s{2,}\S/.test(line) && /[{};=]/.test(line)
+  )).length;
+  return logLike / lines.length >= 0.6
+    || (strongCodeLike + indentedSyntaxLike) / lines.length >= 0.7;
 }
 
 function detectZeroDeltaCorrection(text, config) {
@@ -1041,6 +1060,7 @@ function detectAbabLines(text, config) {
     && (a1.normalized.length + b1.normalized.length) >= config.loopMinPatternSize
   ) {
     const repeatedRegion = text.slice(a1.start, b2.endWithSeparator);
+    if (rangeIntersectsFencedCode(text, a1.start, b2.endWithSeparator)) return null;
     if (looksLikeCodeOrLogs(repeatedRegion)) return null;
     return {
       reason: 'abab_reasoning_loop',
@@ -1049,6 +1069,85 @@ function detectAbabLines(text, config) {
       retainEnd: b1.endWithSeparator,
       repeatCount: 2,
     };
+  }
+  return null;
+}
+
+
+function extractSentences(text) {
+  const sentences = [];
+  const pattern = /[^.!?。！？]+[.!?。！？]+(?:["'”’\)\]]*)/gu;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    const normalized = normalizeLine(match[0]);
+    if (!normalized) continue;
+    sentences.push({
+      raw: match[0],
+      normalized,
+      start: match.index,
+      end: match.index + match[0].length,
+    });
+  }
+  return sentences;
+}
+
+function sameSentenceSequence(sentences, firstStart, secondStart, length) {
+  for (let offset = 0; offset < length; offset += 1) {
+    if (sentences[firstStart + offset].normalized !== sentences[secondStart + offset].normalized) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function detectRepeatedSentenceSequence(text, config) {
+  const sentences = extractSentences(text);
+  if (sentences.length < 4) return null;
+  const maximumTrailingSentences = Math.min(4, sentences.length - 4);
+
+  for (let trailing = 0; trailing <= maximumTrailingSentences; trailing += 1) {
+    const candidateEnd = sentences.length - trailing;
+    const maximumSequenceLength = Math.min(8, Math.floor(candidateEnd / 2));
+    for (let sequenceLength = maximumSequenceLength; sequenceLength >= 2; sequenceLength -= 1) {
+      const secondStart = candidateEnd - sequenceLength;
+      const firstStart = secondStart - sequenceLength;
+      if (firstStart < 0) continue;
+      if (!sameSentenceSequence(sentences, firstStart, secondStart, sequenceLength)) continue;
+
+      const normalizedLength = sentences
+        .slice(firstStart, secondStart)
+        .reduce((sum, sentence) => sum + sentence.normalized.length, 0);
+      if (normalizedLength < config.loopMinPatternSize) continue;
+
+      let cycleStartSentence = firstStart;
+      let repeatCount = 2;
+      while (
+        cycleStartSentence - sequenceLength >= 0
+        && sameSentenceSequence(
+          sentences,
+          cycleStartSentence - sequenceLength,
+          cycleStartSentence,
+          sequenceLength,
+        )
+      ) {
+        cycleStartSentence -= sequenceLength;
+        repeatCount += 1;
+      }
+
+      const cycleStart = sentences[cycleStartSentence].start;
+      const retainEnd = sentences[cycleStartSentence + sequenceLength - 1].end;
+      const secondEnd = sentences[cycleStartSentence + (2 * sequenceLength) - 1].end;
+      if (rangeIntersectsFencedCode(text, cycleStart, secondEnd)) continue;
+      if (looksLikeCodeOrLogs(text.slice(cycleStart, secondEnd))) continue;
+
+      return {
+        reason: 'repeated_sentence_sequence',
+        cycleStart,
+        cycleLength: normalizedLength,
+        retainEnd,
+        repeatCount,
+      };
+    }
   }
   return null;
 }
@@ -1072,7 +1171,6 @@ function extendBoundaryOverSeparators(text, boundary) {
 
 export function detectThinkingLoop(text, config = loadConfig({})) {
   if (typeof text !== 'string' || text.length === 0) return null;
-  if (looksLikeCodeOrLogs(text)) return null;
 
   const correction = detectZeroDeltaCorrection(text, config);
   if (correction) return correction;
@@ -1080,63 +1178,92 @@ export function detectThinkingLoop(text, config = loadConfig({})) {
   const abab = detectAbabLines(text, config);
   if (abab) return abab;
 
+  const sentenceSequence = detectRepeatedSentenceSequence(text, config);
+  if (sentenceSequence) return sentenceSequence;
+
   const mapping = normalizeReasoningWithMap(text);
   const normalized = mapping.normalized;
   const minimum = Math.max(4, config.loopMinPatternSize);
-  const maximum = Math.min(config.loopMaxPatternSize, Math.floor(normalized.length / config.loopMinCount));
+  const maximumTrailingSlack = Math.min(
+    normalized.length,
+    config.loopScanIntervalChars + 32,
+  );
 
-  for (let patternSize = maximum; patternSize >= minimum; patternSize -= 1) {
-    const finalStart = normalized.length - patternSize;
-    const previousStart = finalStart - patternSize;
-    if (previousStart < 0) continue;
-    const pattern = normalized.slice(finalStart);
-    if (normalized.slice(previousStart, finalStart) !== pattern) continue;
+  for (let trailingLength = 0; trailingLength <= maximumTrailingSlack; trailingLength += 1) {
+    const candidateEnd = normalized.length - trailingLength;
+    const maximum = Math.min(
+      config.loopMaxPatternSize,
+      Math.floor(candidateEnd / config.loopMinCount),
+    );
 
-    let repeatCount = 2;
-    let cycleStartNormalized = previousStart;
-    while (
-      cycleStartNormalized - patternSize >= 0
-      && normalized.slice(cycleStartNormalized - patternSize, cycleStartNormalized) === pattern
-    ) {
-      cycleStartNormalized -= patternSize;
-      repeatCount += 1;
+    for (let patternSize = maximum; patternSize >= minimum; patternSize -= 1) {
+      const finalStart = candidateEnd - patternSize;
+      const previousStart = finalStart - patternSize;
+      if (previousStart < 0) continue;
+      const pattern = normalized.slice(finalStart, candidateEnd);
+      if (normalized.slice(previousStart, finalStart) !== pattern) continue;
+
+      if (trailingLength > 0) {
+        const trailing = normalized.slice(candidateEnd);
+        if (trailing && !pattern.startsWith(trailing)) continue;
+      }
+
+      let repeatCount = 2;
+      let cycleStartNormalized = previousStart;
+      while (
+        cycleStartNormalized - patternSize >= 0
+        && normalized.slice(cycleStartNormalized - patternSize, cycleStartNormalized) === pattern
+      ) {
+        cycleStartNormalized -= patternSize;
+        repeatCount += 1;
+      }
+      if (repeatCount < config.loopMinCount) continue;
+
+      const retainEndNormalized = cycleStartNormalized + patternSize;
+      const secondEndNormalized = retainEndNormalized + patternSize;
+      const cycleStart = extendBoundaryOverSeparators(
+        text,
+        rawBoundaryForNormalizedIndex(mapping, cycleStartNormalized, text.length),
+      );
+      const retainEnd = extendBoundaryOverSeparators(
+        text,
+        rawBoundaryForNormalizedIndex(mapping, retainEndNormalized, text.length),
+      );
+      const secondEnd = extendBoundaryOverSeparators(
+        text,
+        rawBoundaryForNormalizedIndex(mapping, secondEndNormalized, text.length),
+      );
+      const repeatedRegion = text.slice(cycleStart, secondEnd);
+      if (rangeIntersectsFencedCode(text, cycleStart, secondEnd)) continue;
+      if (looksLikeCodeOrLogs(repeatedRegion)) continue;
+
+      const rawFirst = text.slice(cycleStart, retainEnd);
+      const rawSecond = text.slice(retainEnd, secondEnd);
+      const exact = rawFirst === rawSecond;
+      return {
+        reason: patternSize > 384
+          ? 'long_tandem_reasoning_loop'
+          : (exact ? 'repeated_reasoning_segment' : 'normalized_reasoning_segment'),
+        cycleStart,
+        cycleLength: patternSize,
+        retainEnd,
+        repeatCount,
+        partialRepeatLength: trailingLength,
+      };
     }
-
-    const retainEndNormalized = cycleStartNormalized + patternSize;
-    const secondEndNormalized = retainEndNormalized + patternSize;
-    const cycleStart = extendBoundaryOverSeparators(
-      text,
-      rawBoundaryForNormalizedIndex(mapping, cycleStartNormalized, text.length),
-    );
-    const retainEnd = extendBoundaryOverSeparators(
-      text,
-      rawBoundaryForNormalizedIndex(mapping, retainEndNormalized, text.length),
-    );
-    const secondEnd = extendBoundaryOverSeparators(
-      text,
-      rawBoundaryForNormalizedIndex(mapping, secondEndNormalized, text.length),
-    );
-    const repeatedRegion = text.slice(cycleStart, secondEnd);
-    if (looksLikeCodeOrLogs(repeatedRegion)) continue;
-
-    const rawFirst = text.slice(cycleStart, retainEnd);
-    const rawSecond = text.slice(retainEnd, secondEnd);
-    const exact = rawFirst === rawSecond;
-    return {
-      reason: exact ? 'repeated_reasoning_segment' : 'normalized_reasoning_segment',
-      cycleStart,
-      cycleLength: patternSize,
-      retainEnd,
-      repeatCount,
-    };
   }
 
   if (normalized.length >= config.loopReasoningCharLimit) {
+    const retainEnd = rawBoundaryForNormalizedIndex(
+      mapping,
+      config.loopReasoningCharLimit,
+      text.length,
+    );
     return {
       reason: 'reasoning_without_action',
       cycleStart: 0,
       cycleLength: normalized.length,
-      retainEnd: Math.min(text.length, config.loopReasoningCharLimit),
+      retainEnd,
       repeatCount: 1,
     };
   }

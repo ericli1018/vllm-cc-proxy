@@ -25,10 +25,8 @@ test('loadConfig ignores legacy model alias environment variables', () => {
   assert.equal(Object.hasOwn(config, 'modelAliases'), false);
   assert.equal(config.heartbeatIntervalMs, 12000);
   assert.equal(config.maxActiveRequests, 4000);
+  assert.equal(config.loopMaxPatternSize, 2048);
   assert.deepEqual(config.samplingDefaults, {
-    temperature: 0.65,
-    top_p: 0.9,
-    top_k: 40,
     max_tokens: 8192,
   });
 });
@@ -68,7 +66,7 @@ test('applyRequestPolicy preserves legal client sampling and required Anthropic 
 });
 
 
-test('applyRequestPolicy replaces invalid client sampling values with safe defaults', () => {
+test('applyRequestPolicy removes invalid optional sampling and defaults required max_tokens', () => {
   const config = loadConfig({});
   const output = applyRequestPolicy({
     model: 'claude-sonnet-4-5',
@@ -80,13 +78,13 @@ test('applyRequestPolicy replaces invalid client sampling values with safe defau
     max_tokens: 0,
   }, config);
 
-  assert.equal(output.temperature, 0.65);
-  assert.equal(output.top_p, 0.9);
-  assert.equal(output.top_k, 40);
+  assert.equal(Object.hasOwn(output, 'temperature'), false);
+  assert.equal(Object.hasOwn(output, 'top_p'), false);
+  assert.equal(Object.hasOwn(output, 'top_k'), false);
   assert.equal(output.max_tokens, 8192);
 });
 
-test('applyRequestPolicy injects defaults only when absent and removes unsupported request fields', () => {
+test('applyRequestPolicy leaves optional sampling absent, defaults max_tokens, and removes unsupported fields', () => {
   const config = loadConfig({});
   const output = applyRequestPolicy({
     model: 'claude-opus-4-1',
@@ -104,9 +102,9 @@ test('applyRequestPolicy injects defaults only when absent and removes unsupport
   }, config);
 
   assert.equal(output.model, 'claude-opus-4-1');
-  assert.equal(output.temperature, 0.65);
-  assert.equal(output.top_p, 0.9);
-  assert.equal(output.top_k, 40);
+  assert.equal(Object.hasOwn(output, 'temperature'), false);
+  assert.equal(Object.hasOwn(output, 'top_p'), false);
+  assert.equal(Object.hasOwn(output, 'top_k'), false);
   assert.equal(output.max_tokens, 8192);
   for (const key of [
     'thinking_token_budget', 'repetition_detection', 'presence_penalty',
@@ -628,4 +626,46 @@ test('selectRecoveryPlan ignores failed network tool results when classifying re
 
   assert.equal(plan.mode, 'network_search');
   assert.equal(plan.selectedTool, 'mcp__searxng__search');
+});
+
+
+test('normal request leaves absent temperature top_p and top_k for vLLM generation defaults', () => {
+  const config = loadConfig({});
+  const output = applyRequestPolicy({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 512,
+    messages: [{ role: 'user', content: 'test' }],
+  }, config);
+
+  assert.equal(Object.hasOwn(output, 'temperature'), false);
+  assert.equal(Object.hasOwn(output, 'top_p'), false);
+  assert.equal(Object.hasOwn(output, 'top_k'), false);
+});
+
+test('normal request removes invalid optional sampling instead of replacing server defaults', () => {
+  const config = loadConfig({});
+  const output = applyRequestPolicy({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 512,
+    temperature: 9,
+    top_p: -1,
+    top_k: 1.5,
+    messages: [{ role: 'user', content: 'test' }],
+  }, config);
+
+  assert.equal(Object.hasOwn(output, 'temperature'), false);
+  assert.equal(Object.hasOwn(output, 'top_p'), false);
+  assert.equal(Object.hasOwn(output, 'top_k'), false);
+});
+
+test('recovery injects its temperature cap when normal request omitted temperature', () => {
+  const config = loadConfig({});
+  const output = applyRequestPolicy({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 8192,
+    messages: [{ role: 'user', content: 'test' }],
+  }, config, { recoveryReason: 'upstream_stream_interrupted' });
+
+  assert.equal(output.temperature, 0.45);
+  assert.equal(output.max_tokens, 4096);
 });

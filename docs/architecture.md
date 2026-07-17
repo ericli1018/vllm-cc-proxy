@@ -9,7 +9,7 @@ Claude Code
   ▼
 vllm-cc-proxy.js
   ├─ authentication replacement
-  ├─ preserve model exactly; apply sampling policy only to POST /v1/messages
+  ├─ preserve model exactly; validate optional sampling only on POST /v1/messages
   ├─ request-local state machine
   ├─ central heartbeat scheduler
   ├─ buffered Anthropic SSE parser
@@ -50,9 +50,15 @@ A central scheduler scans active request contexts. It never writes directly to s
 
 Before `message_start`, the writer sends an SSE comment. After `message_start`, it sends an Anthropic `ping` event. Final output is one writer transaction, so heartbeat cannot split a Tool Call block.
 
+## Normal sampling ownership
+
+The proxy validates but does not synthesize `temperature`, `top_p`, or `top_k` for a normal Messages request. Valid explicit client values remain request-level overrides; absent or invalid optional values are omitted so vLLM applies its `generation_config`／`override_generation_config`. The required `max_tokens` field retains a proxy fallback. Recovery is separate and intentionally injects a lower request-level temperature plus an output-token cap.
+
 ## Thinking Loop
 
-Loop detection only receives `thinking_delta` text from one Thinking content block. It does not inspect user messages, system prompts, text blocks, tool JSON, tool results, fenced source code, or log-like records.
+Loop detection only receives `thinking_delta` text from one Thinking content block. It does not inspect user messages, system prompts, text blocks, tool JSON, or tool results. Detection normalizes case, punctuation, whitespace, and line wrapping; it checks correction loops, line-level A-B-A-B, repeated sentence sequences, tandem repeated regions up to 2048 normalized characters, and a reasoning-without-action limit. Tandem matching permits a bounded partial next cycle so 64-character scan cadence does not require an exact cycle-boundary hit.
+
+Code／log suppression is candidate-local. Ordinary terminal indentation is not sufficient to classify prose as code; fenced ranges, strong programming syntax, and log-dense ranges are excluded only when they overlap the candidate repeated region.
 
 The detector checks bounded pattern sizes and performs scans only after `LOOP_SCAN_INTERVAL_CHARS` additional characters. On detection it records raw character boundaries so normalization never changes emitted text.
 

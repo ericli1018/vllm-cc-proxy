@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0 - 2026-07-17
+
+- Stopped injecting normal-request defaults for `temperature`, `top_p`, and `top_k`; valid client values are preserved and absent／invalid optional values are omitted for vLLM `--override-generation-config`.
+- Kept `DEFAULT_MAX_TOKENS` for the required Anthropic field and preserved Recovery-only request-level temperature／token caps.
+- Raised the default maximum normalized loop period from 384 to 2048 characters.
+- Added repeated-sentence-sequence detection and tandem matching with bounded trailing partial-cycle tolerance.
+- Removed the whole-block code／log early exit; code and log suppression is now limited to the candidate repeated range.
+- Stopped treating ordinary two-space terminal wrapping as code while retaining fenced-code and strong syntax／log exemptions.
+- Added regression coverage for the SSL／rbio-style long wrapped loop, variable wrapping, periods over 384 characters, partial next cycles, and vLLM-owned normal sampling defaults.
+
 ## 0.4.0 - 2026-07-17
 
 - Added `RECOVERY_NETWORK_TOOL_MODE` with `auto`, `configured-only`, and `disabled` modes; `auto` is the default.

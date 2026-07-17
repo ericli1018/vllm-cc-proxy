@@ -144,7 +144,7 @@ function parseSseText(text) {
   return events;
 }
 
-test('forwards Anthropic Messages with the client model unchanged, defaults, and replaced upstream authentication', async (t) => {
+test('forwards Anthropic Messages with the client model unchanged, vLLM-owned optional sampling, and replaced upstream authentication', async (t) => {
   let captured;
   const mock = await startMockVllm(async (req, res) => {
     captured = {
@@ -172,9 +172,9 @@ test('forwards Anthropic Messages with the client model unchanged, defaults, and
   assert.equal(captured.apiKey, 'upstream-key');
   assert.equal(captured.anthropicVersion, '2023-06-01');
   assert.equal(captured.body.model, 'claude-sonnet-4-5');
-  assert.equal(captured.body.temperature, 0.65);
-  assert.equal(captured.body.top_p, 0.9);
-  assert.equal(captured.body.top_k, 40);
+  assert.equal(Object.hasOwn(captured.body, 'temperature'), false);
+  assert.equal(Object.hasOwn(captured.body, 'top_p'), false);
+  assert.equal(Object.hasOwn(captured.body, 'top_k'), false);
   assert.equal(captured.body.max_tokens, 1000);
   assert.match(output, /"text":"ok"/);
 });

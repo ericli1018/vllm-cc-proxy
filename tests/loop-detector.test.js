@@ -121,6 +121,84 @@ test('does not classify repeated fenced code or log records as a reasoning loop'
   assert.equal(detectThinkingLoop(logs, config()), null);
 });
 
+
+
+test('detects long two-space-wrapped technical prose with variable wrapping and a partial next cycle', () => {
+  const sentences = [
+    'The fix is to call it inside the read loop after data has been written to rbio, or just call it once at the start and let the loop handle the WANT_READ state properly.',
+    'Looking at the actual flow: the client connects, sends ClientHello, the server reads it into rbio, then calls SSL_accept which should process that data and return 1.',
+    "I'm realizing the issue might be that SSL_accept is being called before any data arrives in rbio, so it returns WANT_READ immediately.",
+  ];
+  const wrap = (value, width) => {
+    const words = value.split(' ');
+    const lines = [];
+    let line = '  ';
+    for (const word of words) {
+      if (line.length + word.length + 1 > width) {
+        lines.push(line);
+        line = `  ${word}`;
+      } else {
+        line += `${line.trim() ? ' ' : ''}${word}`;
+      }
+    }
+    lines.push(line);
+    return lines.join('\n');
+  };
+  const cycleA = sentences.map((sentence) => wrap(sentence, 76)).join('\n');
+  const cycleB = sentences.map((sentence) => wrap(sentence, 68)).join('\n');
+  const cycleC = sentences.map((sentence) => wrap(sentence, 82)).join('\n');
+  const partial = wrap(sentences[0].slice(0, 88), 64);
+  const text = `Initial TLS observation.\n${cycleA}\n${cycleB}\n${cycleC}\n${partial}`;
+
+  const loop = detectThinkingLoop(text, config({
+    LOOP_MAX_PATTERN_SIZE: '2048',
+    LOOP_SCAN_INTERVAL_CHARS: '64',
+  }));
+
+  assert.ok(loop);
+  assert.match(loop.reason, /sentence|reasoning_segment|tandem/);
+  assert.match(text.slice(0, loop.retainEnd), /Initial TLS observation/);
+  assert.equal(text.slice(0, loop.retainEnd).includes(cycleB), false);
+});
+
+test('detects a normalized cycle longer than 384 characters before a partial trailing repeat', () => {
+  const cycle = [
+    'Inspect the TLS state machine using only observable transitions and preserve all prior verified progress.',
+    'Confirm whether ciphertext was written to rbio before SSL_accept and whether pending wbio output was drained.',
+    'Use the next concrete diagnostic action instead of restating the same hypothesis without new evidence.',
+    'Record the exact SSL_get_error result and the BIO pending byte counts before revising the implementation.',
+  ].join(' ');
+  assert.ok(cycle.length > 384);
+  const text = `Prefix evidence. ${cycle} ${cycle} ${cycle.slice(0, 72)}`;
+
+  const loop = detectThinkingLoop(text, config({ LOOP_MAX_PATTERN_SIZE: '2048' }));
+
+  assert.ok(loop);
+  assert.equal(loop.cycleLength > 384, true);
+  assert.equal(text.slice(0, loop.retainEnd).includes(cycle + ' ' + cycle), false);
+});
+
+test('does not treat ordinary two-space prose wrapping as code', () => {
+  const cycle = [
+    '  This is ordinary wrapped reasoning text without programming syntax.',
+    '  It repeats because the model is stuck, not because it is quoting code.',
+  ].join('\n');
+  const loop = detectThinkingLoop(`${cycle}\n${cycle}`, config({ LOOP_MAX_PATTERN_SIZE: '512' }));
+  assert.ok(loop);
+});
+
+test('still exempts strongly code-like indented repeated regions', () => {
+  const code = [
+    '  if (ret <= 0) {',
+    '    error = SSL_get_error(ssl, ret);',
+    '  }',
+    '  if (ret <= 0) {',
+    '    error = SSL_get_error(ssl, ret);',
+    '  }',
+  ].join('\n');
+  assert.equal(detectThinkingLoop(code, config({ LOOP_MAX_PATTERN_SIZE: '512' })), null);
+});
+
 test('mergeRecovery keeps retained first thinking, appends recovery thinking, and discards first output and tools', () => {
   const firstText = 'Prefix.\nCycle action.\nCycle action.\n';
   const loop = detectThinkingLoop(firstText, config());

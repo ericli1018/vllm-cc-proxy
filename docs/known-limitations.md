@@ -26,7 +26,7 @@ The vLLM 0.23 Anthropic request model does not expose the Claude `thinking` obje
 
 ## Sampling fields
 
-Only request fields accepted by the Anthropic-compatible endpoint are injected. OpenAI-only fields such as `repetition_penalty`, `presence_penalty`, `frequency_penalty`, and `min_p` are removed. Configure backend-only generation behavior in vLLM/model generation configuration. Request-level `seed` is also removed because it is not part of the vLLM 0.23 Anthropic request model.
+Normal requests do not receive proxy defaults for `temperature`, `top_p`, or `top_k`; absent or invalid optional values are omitted so vLLM generation configuration can supply them. A valid value explicitly sent by Claude Code is preserved and therefore remains a request-level override of the server default. OpenAI-only fields such as `repetition_penalty`, `presence_penalty`, `frequency_penalty`, and `min_p` are removed. Configure backend-only generation behavior in vLLM/model generation configuration. Request-level `seed` is also removed because it is not part of the vLLM 0.23 Anthropic request model.
 
 ## DFlash and parsers
 
@@ -45,6 +45,11 @@ The URL detector intentionally does not parse arbitrary user prose, relative lin
 The progress-preservation prompt constrains the recovery generation. After the real Tool Result returns in a later Claude Code request, normal model behavior resumes; the proxy cannot guarantee that the model will never reconsider prior work. Existing runtime policies and tests should still enforce decision preservation and evidence-gated changes.
 
 Network recovery rejects non-empty Text output, zero or multiple Tool Calls, names outside the allowed candidate set, and a non-`tool_use` stop reason, but it does not reject valid Thinking blocks. Some reasoning models emit Thinking even when a Tool Call is required; rejecting all Thinking would make recovery brittle. The prompt, 1024-token default cap, Loop detector, and single-recovery limit constrain this behavior but cannot prove the model did not internally reconsider prior hypotheses.
+
+
+## Loop detection remains heuristic
+
+The detector now covers long tandem cycles, repeated sentence sequences, variable terminal wrapping, and a bounded partial next repeat. It still cannot prove semantic equivalence when the model continuously paraphrases the same idea with different wording. Fenced code and strongly code／log-like candidate ranges are intentionally exempt, so a reasoning loop embedded entirely in a genuine code quotation may not be interrupted. `reasoning_without_action` remains the final safety bound for loops that do not expose enough repeated surface form.
 
 ## Global buffer accounting
 

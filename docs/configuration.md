@@ -17,10 +17,7 @@ All settings are environment variables. Values shown are defaults.
 | Variable | Default | Meaning |
 |---|---:|---|
 | `DEFAULT_ENABLE_THINKING` | `true` | Fallback `chat_template_kwargs.enable_thinking`; incoming model names containing `haiku` or `instruct` default to false unless explicitly enabled. |
-| `DEFAULT_TEMPERATURE` | `0.65` | Injected only when incoming value is absent or invalid. |
-| `DEFAULT_TOP_P` | `0.90` | Valid range 0–1. |
-| `DEFAULT_TOP_K` | `40` | Non-negative integer. |
-| `DEFAULT_MAX_TOKENS` | `8192` | Positive integer. |
+| `DEFAULT_MAX_TOKENS` | `8192` | Positive fallback for the required Anthropic `max_tokens` field. |
 
 Request priority for Thinking mode:
 
@@ -32,6 +29,16 @@ Claude thinking.type enabled/disabled
 ```
 
 `thinking.budget_tokens` is not forwarded because vLLM 0.23 does not expose it in the Anthropic request model.
+
+
+Normal `/v1/messages` requests do not receive Proxy defaults for `temperature`, `top_p`, or `top_k`. Valid client-provided values are preserved; absent or invalid optional values are omitted so vLLM can apply its generation configuration. A typical Ornith server configuration is:
+
+```text
+--generation-config vllm
+--override-generation-config '{"temperature":0.6,"top_p":0.95,"top_k":20}'
+```
+
+Generic and network Recovery requests still set their own request-level `temperature` and `max_tokens` caps.
 
 ## Recovery
 
@@ -117,7 +124,7 @@ During network recovery the short Ornith-specific instruction preserves complete
 | Variable | Default | Meaning |
 |---|---:|---|
 | `LOOP_MIN_PATTERN_SIZE` | `24` | Minimum normalized cycle size. |
-| `LOOP_MAX_PATTERN_SIZE` | `384` | Maximum normalized cycle size. |
+| `LOOP_MAX_PATTERN_SIZE` | `2048` | Maximum normalized cycle size for tandem matching. |
 | `LOOP_MIN_COUNT` | `2` | Detection threshold. |
 | `LOOP_REASONING_CHAR_LIMIT` | `24000` | Thinking-only safety limit without an action. |
 | `LOOP_SCAN_INTERVAL_CHARS` | `64` | Minimum new Thinking characters between scans. |
