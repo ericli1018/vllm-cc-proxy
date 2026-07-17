@@ -4,10 +4,9 @@ PROXY_PORT=3456
 PROXY_API_KEY=replace-with-a-long-random-proxy-key
 
 # vLLM upstream
+# Proxy preserves the incoming model name exactly; configure vLLM --served-model-name to match Claude Code.
 VLLM_BASE_URL=http://vllm:8001
 VLLM_API_KEY=vllm
-REAL_MODEL=Ornith-1.0-35B-NVFP4
-MODEL_ALIASES_JSON={"claude-opus-4-1":"Ornith-1.0-35B-NVFP4","claude-opus-4-5":"Ornith-1.0-35B-NVFP4","claude-sonnet-4-5":"Ornith-1.0-35B-NVFP4","claude-haiku-3-5":"Ornith-1.0-35B-NVFP4","ornith-think-general":"Ornith-1.0-35B-NVFP4","ornith-think-coding":"Ornith-1.0-35B-NVFP4","ornith-instruct-general":"Ornith-1.0-35B-NVFP4"}
 
 # Thinking mode is translated to vLLM chat_template_kwargs.enable_thinking
 DEFAULT_ENABLE_THINKING=true

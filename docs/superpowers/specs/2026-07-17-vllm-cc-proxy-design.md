@@ -6,15 +6,17 @@ Build a standalone Node.js 22 reverse proxy that accepts Claude Code Anthropic M
 
 ## Protocol boundary
 
-- Downstream: Anthropic-compatible `POST /v1/messages` and `POST /v1/messages/count_tokens`.
-- Upstream: the same paths on vLLM.
+- Managed downstream path: Anthropic-compatible `POST /v1/messages`.
+- Upstream managed path: the same `/v1/messages` path on vLLM.
+- Proxy-local paths: `/health/live`, `/health/ready`, and `/metrics`.
+- Every other method/path/query is forwarded as a raw byte stream to vLLM.
 - No Anthropic-to-OpenAI conversion in the proxy.
 - Requests retain `messages`, `system`, `tools`, `tool_choice`, `stop_sequences`, `metadata`, and `stream` unless a documented proxy policy applies.
-- `/v1/messages/count_tokens` only applies model aliases and authentication replacement; it does not inject sampling values or run watchdog logic.
+- Transparent routes receive authentication replacement only; request and response protocol bytes are otherwise preserved.
 
 ## Request policy
 
-- Resolve configured aliases to one real vLLM served model name.
+- Preserve the incoming `model` value exactly; vLLM `--served-model-name` must match Claude Code.
 - Preserve valid client-provided `temperature`, `top_p`, `top_k`, and `max_tokens`.
 - Inject defaults only when absent.
 - Do not inject OpenAI-only request fields into Anthropic `/v1/messages`.

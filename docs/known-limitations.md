@@ -4,6 +4,12 @@
 
 The proxy requires the upstream vLLM deployment to expose compatible `/v1/messages` and `/v1/messages/count_tokens` endpoints. It does not fall back to `/v1/chat/completions`.
 
+## Transparent non-message routes
+
+Only `POST /v1/messages` receives schema normalization, sampling defaults, Thinking mapping, Watchdog, Heartbeat, and Recovery. `/v1/messages/count_tokens`, `/v1/models`, and every other non-local route are byte-stream passthroughs. Consequently, vLLM must accept the exact method, path, headers, and body emitted by the installed Claude Code version. Unsupported Claude-specific fields on those routes are intentionally not repaired by this proxy.
+
+The proxy also does not provide model aliases. vLLM `--served-model-name` must exactly match the model identifier selected by Claude Code.
+
 ## Buffered latency
 
 Assistant content is intentionally delayed until one attempt is structurally complete. Heartbeats remain live, but Thinking, Text, and Tool Calls are not delivered token-by-token.

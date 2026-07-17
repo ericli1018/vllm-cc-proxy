@@ -1,9 +1,5 @@
-volumes:
   vllm-cc-proxy:
-
-services:
-  vllm-cc-proxy:
-    image: node:22-alpine
+    image: node:22-slim
     container_name: vllm-cc-proxy
     init: true
     depends_on:
@@ -21,9 +17,9 @@ services:
 
       VLLM_BASE_URL: "http://vllm:8001"
       VLLM_API_KEY: "${VLLM_API_KEY:-vllm}"
-      REAL_MODEL: "ornith-1.0-35b"
+      REAL_MODEL: "Ornith-1.0-35B-NVFP4"
       MODEL_ALIASES_JSON: >-
-        {"claude-opus-4-8":"ornith-1.0-35b","claude-fable-5":"ornith-1.0-35b","claude-sonnet-4-6":"ornith-1.0-35b","claude-haiku-4-5-20251001":"ornith-1.0-35b"}
+        {"claude-opus-4-1":"Ornith-1.0-35B-NVFP4","claude-opus-4-5":"Ornith-1.0-35B-NVFP4","claude-sonnet-4-5":"Ornith-1.0-35B-NVFP4","claude-haiku-3-5":"Ornith-1.0-35B-NVFP4","ornith-think-general":"Ornith-1.0-35B-NVFP4","ornith-think-coding":"Ornith-1.0-35B-NVFP4","ornith-instruct-general":"Ornith-1.0-35B-NVFP4"}
 
       DEFAULT_ENABLE_THINKING: "true"
       DEFAULT_TEMPERATURE: "0.65"
@@ -58,17 +54,23 @@ services:
       LOOP_SCAN_INTERVAL_CHARS: "64"
       LOG_LEVEL: "info"
     volumes:
-      - vllm-cc-proxy:/app
-    command: >
-      sh -c "
-        apk add --no-cache git &&
-        if [ ! -f /app/vllm-cc-proxy.js ]; then
-          git clone https://github.com/ericli1018/vllm-cc-proxy /app;
-        else 
-          cd /app && git pull;
-        fi &&
-        node /app/vllm-cc-proxy.js
-      "
+      - ./vllm-cc-proxy.js:/app/vllm-cc-proxy.js:ro
+    entrypoint:
+      - node
+      - /app/vllm-cc-proxy.js
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3456/health/ready')
+          .then((response)=>process.exit(response.ok?0:1))
+          .catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
     ulimits:
       nofile:
         soft: 262144

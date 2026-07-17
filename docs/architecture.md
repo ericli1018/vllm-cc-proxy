@@ -9,7 +9,7 @@ Claude Code
   ▼
 vllm-cc-proxy.js
   ├─ authentication replacement
-  ├─ model alias and sampling request policy
+  ├─ preserve model exactly; apply sampling policy only to POST /v1/messages
   ├─ request-local state machine
   ├─ central heartbeat scheduler
   ├─ buffered Anthropic SSE parser
@@ -24,7 +24,7 @@ vLLM 0.23
 Ornith-1.0-35B-NVFP4
 ```
 
-No Anthropic/OpenAI protocol conversion exists in this project.
+No Anthropic/OpenAI protocol conversion exists in this project. Proxy-local health／metrics endpoints are handled locally. Every non-`POST /v1/messages` request is streamed transparently to the same upstream path and query without JSON parsing or model rewriting.
 
 ## Request state machine
 

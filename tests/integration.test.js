@@ -96,7 +96,6 @@ async function startProxy(baseUrl, env = {}) {
       VLLM_BASE_URL: baseUrl,
       VLLM_API_KEY: 'upstream-key',
       PROXY_API_KEY: 'proxy-key',
-      REAL_MODEL: 'Ornith-1.0-35B-NVFP4',
       LOOP_MIN_PATTERN_SIZE: '12',
       LOOP_MAX_PATTERN_SIZE: '160',
       LOG_LEVEL: 'silent',
@@ -145,7 +144,7 @@ function parseSseText(text) {
   return events;
 }
 
-test('forwards Anthropic Messages with model alias, defaults, and replaced upstream authentication', async (t) => {
+test('forwards Anthropic Messages with the client model unchanged, defaults, and replaced upstream authentication', async (t) => {
   let captured;
   const mock = await startMockVllm(async (req, res) => {
     captured = {
@@ -172,7 +171,7 @@ test('forwards Anthropic Messages with model alias, defaults, and replaced upstr
   assert.equal(captured.authorization, 'Bearer upstream-key');
   assert.equal(captured.apiKey, 'upstream-key');
   assert.equal(captured.anthropicVersion, '2023-06-01');
-  assert.equal(captured.body.model, 'Ornith-1.0-35B-NVFP4');
+  assert.equal(captured.body.model, 'claude-sonnet-4-5');
   assert.equal(captured.body.temperature, 0.65);
   assert.equal(captured.body.top_p, 0.9);
   assert.equal(captured.body.top_k, 40);
@@ -303,7 +302,7 @@ test('discards an accidentally truncated first stream and returns a complete rec
   assert.equal(output.includes('complete recovery'), true);
 });
 
-test('forwards count_tokens without sampling injection or watchdog', async (t) => {
+test('transparently forwards count_tokens without modifying generation fields', async (t) => {
   let captured;
   const mock = await startMockVllm(async (req, res) => {
     captured = await readJsonRequest(req);
@@ -324,10 +323,10 @@ test('forwards count_tokens without sampling injection or watchdog', async (t) =
 
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { input_tokens: 123 });
-  assert.equal(captured.model, 'Ornith-1.0-35B-NVFP4');
-  assert.equal(Object.hasOwn(captured, 'temperature'), false);
-  assert.equal(Object.hasOwn(captured, 'max_tokens'), false);
-  assert.equal(Object.hasOwn(captured, 'stream'), false);
+  assert.equal(captured.model, 'claude-haiku-3-5');
+  assert.equal(captured.temperature, 0.2);
+  assert.equal(captured.max_tokens, 100);
+  assert.equal(captured.stream, true);
 });
 
 test('keeps concurrent request tool arguments isolated', async (t) => {
@@ -720,4 +719,109 @@ test('per-attempt response buffer limit aborts immediately and recovers without 
   assert.equal(firstClosed, true);
   assert.match(output, /recovered after buffer limit/);
   assert.ok(elapsed < 500, `expected immediate limit handling, got ${elapsed}ms`);
+});
+
+test('transparently forwards count_tokens with the exact model and raw JSON body', async (t) => {
+  let captured;
+  const mock = await startMockVllm(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    captured = {
+      method: req.method,
+      url: req.url,
+      authorization: req.headers.authorization,
+      contentType: req.headers['content-type'],
+      rawBody: Buffer.concat(chunks).toString('utf8'),
+    };
+    res.writeHead(207, {
+      'content-type': 'application/json',
+      'x-upstream-marker': 'count-tokens',
+    });
+    res.end('{"input_tokens":321}');
+  });
+  const proxy = await startProxy(mock.baseUrl);
+  t.after(async () => { await proxy.close(); await mock.close(); });
+
+  const rawBody = '{\n  "model": "claude-sonnet-4-6",\n  "messages": [{"role":"user","content":"count"}]\n}';
+  const response = await fetch(`${proxy.url}/v1/messages/count_tokens?beta=1`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': 'proxy-key',
+      'anthropic-version': '2023-06-01',
+    },
+    body: rawBody,
+  });
+
+  assert.equal(response.status, 207);
+  assert.equal(response.headers.get('x-upstream-marker'), 'count-tokens');
+  assert.equal(await response.text(), '{"input_tokens":321}');
+  assert.equal(captured.method, 'POST');
+  assert.equal(captured.url, '/v1/messages/count_tokens?beta=1');
+  assert.equal(captured.authorization, 'Bearer upstream-key');
+  assert.equal(captured.contentType, 'application/json');
+  assert.equal(captured.rawBody, rawBody);
+});
+
+test('transparently forwards non-message paths, methods, queries, status, headers, and bytes', async (t) => {
+  let captured;
+  const mock = await startMockVllm(async (req, res) => {
+    captured = {
+      method: req.method,
+      url: req.url,
+      authorization: req.headers.authorization,
+    };
+    res.writeHead(206, {
+      'content-type': 'application/octet-stream',
+      'x-upstream-marker': 'models',
+    });
+    res.end(Buffer.from([0, 1, 2, 255]));
+  });
+  const proxy = await startProxy(mock.baseUrl);
+  t.after(async () => { await proxy.close(); await mock.close(); });
+
+  const response = await fetch(`${proxy.url}/v1/models?limit=7`, {
+    method: 'GET',
+    headers: { 'x-api-key': 'proxy-key' },
+  });
+
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get('x-upstream-marker'), 'models');
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [0, 1, 2, 255]);
+  assert.equal(captured.method, 'GET');
+  assert.equal(captured.url, '/v1/models?limit=7');
+  assert.equal(captured.authorization, 'Bearer upstream-key');
+});
+
+
+test('transparent forwarding pins absolute-form request targets to the configured vLLM origin', async (t) => {
+  let capturedUrl;
+  const mock = await startMockVllm(async (req, res) => {
+    capturedUrl = req.url;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const proxy = await startProxy(mock.baseUrl);
+  t.after(async () => { await proxy.close(); await mock.close(); });
+
+  const proxyAddress = new URL(proxy.url);
+  const result = await new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: proxyAddress.hostname,
+      port: proxyAddress.port,
+      method: 'GET',
+      path: 'http://untrusted.invalid/v1/models?limit=9',
+      headers: { 'x-api-key': 'proxy-key' },
+    }, async (res) => {
+      const chunks = [];
+      for await (const chunk of res) chunks.push(chunk);
+      resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') });
+    });
+    req.once('error', reject);
+    req.end();
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body, '{"ok":true}');
+  assert.equal(capturedUrl, '/v1/models?limit=9');
 });

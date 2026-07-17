@@ -88,7 +88,6 @@ test('high-concurrency requests keep fragmented tool calls isolated', { timeout:
       VLLM_BASE_URL: `http://127.0.0.1:${upstreamAddress.port}`,
       VLLM_API_KEY: 'upstream-key',
       PROXY_API_KEY: 'proxy-key',
-      REAL_MODEL: 'Ornith-1.0-35B-NVFP4',
       MAX_ACTIVE_REQUESTS: String(count + 10),
       MAX_TOTAL_BUFFERED_BYTES: String(256 * 1024 * 1024),
       HEARTBEAT_INTERVAL_MS: '1000',

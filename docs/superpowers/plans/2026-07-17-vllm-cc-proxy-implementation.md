@@ -12,7 +12,7 @@
 
 - Do not modify CCR or vLLM source.
 - Do not translate Anthropic Messages into OpenAI Chat Completions.
-- Support `POST /v1/messages` and `POST /v1/messages/count_tokens`.
+- Manage only `POST /v1/messages`; transparently forward every other non-local route.
 - Default watchdog mode is buffered.
 - Heartbeats use Anthropic `event: ping` and continue during thinking, tool-call buffering, and recovery.
 - Tool-call arguments are emitted only after complete ordered assembly and successful JSON parsing.
@@ -36,7 +36,7 @@
 **Interfaces:**
 - Produces: `loadConfig(env)` and `applyRequestPolicy(body, config, { recoveryReason })` exported from `vllm-cc-proxy.js`.
 
-- [x] Write failing tests for environment parsing, model aliases, preserved client sampling, injected defaults, rejected body size, and recovery overrides.
+- [x] Write failing tests for environment parsing, preserved client model names, preserved client sampling, injected defaults, rejected body size, and recovery overrides.
 - [x] Run `node --test tests/config.test.js` and confirm failure because the module does not exist.
 - [x] Implement the minimum configuration and request-policy functions.
 - [x] Run the test and confirm it passes.
@@ -95,7 +95,7 @@
 
 - [x] Write a mock vLLM server and failing integration tests for normal streams, heartbeat during delay, loop recovery, stream truncation recovery, tool-call recovery, count tokens, upstream errors, concurrent isolation, capacity rejection, and downstream cancellation.
 - [x] Run tests and verify red.
-- [x] Implement endpoint routing, auth replacement, upstream fetch/abort/timeouts, one recovery, SSE errors, health, metrics, and draining.
+- [x] Implement managed-message routing, transparent non-message forwarding, auth replacement, upstream fetch/abort/timeouts, one recovery, SSE errors, health, metrics, and draining.
 - [x] Run integration and full tests.
 
 ### Task 6: Docker Deployment and Documentation

@@ -3,6 +3,7 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { once } from 'node:events';
 import http from 'node:http';
+import https from 'node:https';
 import { pathToFileURL } from 'node:url';
 
 const UNSUPPORTED_ANTHROPIC_REQUEST_FIELDS = [
@@ -16,18 +17,6 @@ const UNSUPPORTED_ANTHROPIC_REQUEST_FIELDS = [
   'reasoning_budget',
   'reasoning_effort',
   'seed',
-];
-
-const GENERATION_ONLY_FIELDS = [
-  'temperature',
-  'top_p',
-  'top_k',
-  'max_tokens',
-  'stream',
-  'stop_sequences',
-  'thinking',
-  'output_config',
-  ...UNSUPPORTED_ANTHROPIC_REQUEST_FIELDS,
 ];
 
 function parseInteger(value, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
@@ -56,41 +45,13 @@ function trimTrailingSlash(value) {
   return String(value).replace(/\/+$/, '');
 }
 
-function parseAliases(raw, realModel) {
-  const defaults = {
-    'claude-opus-4-1': realModel,
-    'claude-opus-4-5': realModel,
-    'claude-sonnet-4-5': realModel,
-    'claude-haiku-3-5': realModel,
-    'ornith-think-general': realModel,
-    'ornith-think-coding': realModel,
-    'ornith-instruct-general': realModel,
-  };
-  if (!raw) return defaults;
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return defaults;
-    for (const [key, value] of Object.entries(parsed)) {
-      if (typeof key === 'string' && key && typeof value === 'string' && value) {
-        defaults[key.toLowerCase()] = value;
-      }
-    }
-  } catch {
-    return defaults;
-  }
-  return defaults;
-}
-
 export function loadConfig(env = process.env) {
-  const realModel = env.REAL_MODEL || 'Ornith-1.0-35B-NVFP4';
   return Object.freeze({
     host: env.PROXY_HOST || '0.0.0.0',
     port: parseInteger(env.PROXY_PORT, 3456, { min: 1, max: 65535 }),
     vllmBaseUrl: trimTrailingSlash(env.VLLM_BASE_URL || 'http://vllm:8001'),
     vllmApiKey: env.VLLM_API_KEY || 'vllm',
     proxyApiKey: env.PROXY_API_KEY || '',
-    realModel,
-    modelAliases: Object.freeze(parseAliases(env.MODEL_ALIASES_JSON, realModel)),
     samplingDefaults: Object.freeze({
       temperature: parseNumber(env.DEFAULT_TEMPERATURE, 0.65, { min: 0, max: 2 }),
       top_p: parseNumber(env.DEFAULT_TOP_P, 0.9, { min: 0, max: 1 }),
@@ -122,18 +83,6 @@ export function loadConfig(env = process.env) {
     loopScanIntervalChars: parseInteger(env.LOOP_SCAN_INTERVAL_CHARS, 64, { min: 8 }),
     logLevel: env.LOG_LEVEL || 'info',
   });
-}
-
-function resolveModel(model, config) {
-  const candidate = typeof model === 'string' && model ? model : config.realModel;
-  const exact = config.modelAliases[candidate.toLowerCase()];
-  if (exact) return exact;
-  const lower = candidate.toLowerCase();
-  if (lower.includes('opus') || lower.includes('sonnet') || lower.includes('haiku')) {
-    return config.realModel;
-  }
-  if (lower.startsWith('ornith-')) return config.realModel;
-  return candidate;
 }
 
 function applyThinkingPolicy(body, originalModel, config) {
@@ -184,7 +133,6 @@ function removeUnsupportedFields(body) {
 export function applyRequestPolicy(input, config, { recoveryReason = null } = {}) {
   const body = structuredClone(input);
   const originalModel = body.model;
-  body.model = resolveModel(body.model, config);
   applyThinkingPolicy(body, originalModel, config);
   removeUnsupportedFields(body);
 
@@ -210,14 +158,6 @@ export function applyRequestPolicy(input, config, { recoveryReason = null } = {}
   return body;
 }
 
-export function applyCountTokensPolicy(input, config) {
-  const body = structuredClone(input);
-  const originalModel = body.model;
-  body.model = resolveModel(body.model, config);
-  applyThinkingPolicy(body, originalModel, config);
-  for (const key of GENERATION_ONLY_FIELDS) delete body[key];
-  return body;
-}
 
 
 function encodeSseFrame(event, data) {
@@ -1083,7 +1023,7 @@ export class RequestContext {
           type: 'message',
           role: 'assistant',
           content: [],
-          model: upstreamMessage.model || this.config.realModel,
+          model: upstreamMessage.model || this.originalRequest?.model || 'unknown',
           stop_reason: null,
           stop_sequence: null,
           usage: upstreamMessage.usage || { input_tokens: 0, output_tokens: 0 },
@@ -1404,6 +1344,99 @@ async function forwardNonStreaming({ path, body, request, config, requestId, sig
   };
 }
 
+
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+
+function buildTransparentRequestHeaders(request, config, requestId) {
+  const headers = {};
+  for (const [name, value] of Object.entries(request.headers)) {
+    const lower = name.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+    if (['host', 'authorization', 'x-api-key', 'x-request-id'].includes(lower)) continue;
+    if (value !== undefined) headers[name] = value;
+  }
+  headers.authorization = `Bearer ${config.vllmApiKey}`;
+  headers['x-api-key'] = config.vllmApiKey;
+  headers['x-request-id'] = requestId;
+  return headers;
+}
+
+function buildTransparentResponseHeaders(upstreamHeaders) {
+  const headers = {};
+  for (const [name, value] of Object.entries(upstreamHeaders)) {
+    if (value === undefined || HOP_BY_HOP_HEADERS.has(name.toLowerCase())) continue;
+    headers[name] = value;
+  }
+  return headers;
+}
+
+async function forwardTransparent({ request, response, config, requestId }) {
+  const incoming = new URL(request.url || '/', 'http://proxy.local');
+  const target = new URL(`${config.vllmBaseUrl}/`);
+  target.pathname = incoming.pathname;
+  target.search = incoming.search;
+  target.hash = '';
+  const transport = target.protocol === 'https:' ? https : http;
+
+  await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+
+    const upstreamRequest = transport.request(target, {
+      method: request.method,
+      headers: buildTransparentRequestHeaders(request, config, requestId),
+      setHost: true,
+    }, (upstreamResponse) => {
+      if (!response.headersSent) {
+        response.writeHead(
+          upstreamResponse.statusCode || 502,
+          upstreamResponse.statusMessage,
+          buildTransparentResponseHeaders(upstreamResponse.headers),
+        );
+      }
+      upstreamResponse.once('error', (error) => {
+        if (!response.destroyed) response.destroy(error);
+        finish();
+      });
+      upstreamResponse.once('end', finish);
+      upstreamResponse.pipe(response);
+    });
+
+    upstreamRequest.once('error', (error) => {
+      if (!response.headersSent) {
+        jsonResponse(response, 502, proxyErrorPayload('api_error', safeErrorMessage(error), requestId));
+      } else if (!response.destroyed) {
+        response.destroy(error);
+      }
+      finish();
+    });
+
+    request.once('aborted', () => {
+      upstreamRequest.destroy(new Error('client disconnected'));
+      finish();
+    });
+    response.once('close', () => {
+      if (!response.writableEnded) upstreamRequest.destroy(new Error('client disconnected'));
+      finish();
+    });
+
+    request.pipe(upstreamRequest);
+  });
+}
+
 function openSse(response, requestId) {
   response.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
@@ -1486,18 +1519,18 @@ export function createProxyServer(config = loadConfig()) {
     request.socket.setKeepAlive(true, 15000);
     request.socket.setNoDelay(true);
 
-    if (request.method === 'GET' && request.url === '/health/live') {
+    const incomingUrl = new URL(request.url || '/', 'http://proxy.local');
+    const pathname = incomingUrl.pathname;
+
+    if (request.method === 'GET' && pathname === '/health/live') {
       return jsonResponse(response, 200, { status: 'ok' });
     }
-    if (request.method === 'GET' && request.url === '/health/ready') {
+    if (request.method === 'GET' && pathname === '/health/ready') {
       return jsonResponse(response, draining ? 503 : 200, { status: draining ? 'draining' : 'ready' });
     }
-    if (request.method === 'GET' && request.url === '/metrics') {
+    if (request.method === 'GET' && pathname === '/metrics') {
       response.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
       return response.end(renderMetrics(metrics));
-    }
-    if (request.method !== 'POST' || !['/v1/messages', '/v1/messages/count_tokens'].includes(request.url)) {
-      return jsonResponse(response, 404, proxyErrorPayload('not_found_error', 'Endpoint not found.', randomUUID()));
     }
     if (!authenticate(request, config)) {
       return jsonResponse(response, 401, proxyErrorPayload('authentication_error', 'Invalid API key.', randomUUID()));
@@ -1523,6 +1556,19 @@ export function createProxyServer(config = loadConfig()) {
     response.once('close', releaseAdmission);
 
     const requestId = `proxy_req_${randomUUID().replaceAll('-', '')}`;
+    const isManagedMessages = request.method === 'POST' && pathname === '/v1/messages';
+
+    if (!isManagedMessages) {
+      try {
+        await forwardTransparent({ request, response, config, requestId });
+      } catch (error) {
+        if (!response.headersSent) {
+          return jsonResponse(response, 502, proxyErrorPayload('api_error', safeErrorMessage(error), requestId));
+        }
+      }
+      return;
+    }
+
     let input;
     try {
       input = await readBody(request, config.maxRequestBodyBytes);
@@ -1532,31 +1578,6 @@ export function createProxyServer(config = loadConfig()) {
         error.statusCode || 400,
         proxyErrorPayload('invalid_request_error', safeErrorMessage(error), requestId),
       );
-    }
-
-    if (request.url === '/v1/messages/count_tokens') {
-      const controller = new AbortController();
-      const onAbort = () => controller.abort('client disconnected');
-      request.once('aborted', onAbort);
-      response.once('close', () => {
-        if (!response.writableEnded) controller.abort('client disconnected');
-      });
-      try {
-        const body = applyCountTokensPolicy(input, config);
-        const upstream = await forwardNonStreaming({
-          path: '/v1/messages/count_tokens', body, request, config, requestId,
-          signal: controller.signal,
-        });
-        response.writeHead(upstream.status, {
-          'content-type': upstream.contentType,
-          'cache-control': 'no-store',
-          'x-request-id': requestId,
-        });
-        return response.end(upstream.buffer);
-      } catch (error) {
-        if (controller.signal.aborted) return;
-        return jsonResponse(response, 502, proxyErrorPayload('api_error', safeErrorMessage(error), requestId));
-      }
     }
 
     const policyBody = applyRequestPolicy(input, config);
@@ -1668,7 +1689,6 @@ export function createProxyServer(config = loadConfig()) {
         includeMessageStart: false,
         messageId: context.outputMessageId,
         signature: `proxy_${randomUUID()}`,
-        model: config.realModel,
       });
       await context.writer.writeTransaction([serialized]);
       await context.complete();
@@ -1733,7 +1753,7 @@ async function runMain() {
   await app.listen();
   logEvent(config, {
     event: 'proxy_started', host: config.host, port: config.port,
-    upstream: config.vllmBaseUrl, model: config.realModel,
+    upstream: config.vllmBaseUrl,
   });
 
   let shuttingDown = false;

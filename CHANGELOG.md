@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 - 2026-07-17
+
+- Removed all model alias and `REAL_MODEL` behavior; `/v1/messages` now preserves the client model exactly.
+- Added raw transparent forwarding for every non-local route other than managed `POST /v1/messages`.
+- Made `/v1/messages/count_tokens` preserve the exact model, raw JSON bytes, query string, generation fields, status, headers, and response bytes.
+- Added passthrough tests for arbitrary methods, binary response bytes, query strings, legacy alias variables being ignored, and absolute-form request targets being pinned to the configured vLLM origin.
+
 ## 0.1.0 - 2026-07-17
 
 - Added direct Anthropic Messages forwarding for Claude Code and vLLM.

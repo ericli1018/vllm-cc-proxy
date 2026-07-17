@@ -11,7 +11,7 @@ Claude Code
 → Ornith-1.0-35B-NVFP4
 ```
 
-Proxy **不做 Anthropic ↔ OpenAI 格式轉換**。它在相同 `/v1/messages` 協議中執行 request policy、完整緩衝、Thinking Loop 偵測、Tool Call 組裝、Heartbeat、一次內部 Recovery 與高併發隔離。
+Proxy **不做 Anthropic ↔ OpenAI 格式轉換**。只有精確的 `POST /v1/messages` 進入 request policy、完整緩衝、Thinking Loop 偵測、Tool Call 組裝、Heartbeat 與一次內部 Recovery。Proxy 本地的 health／metrics 路徑除外，其餘 method、path、query、raw request body、upstream status、headers 與 response bytes 均採透明轉送。
 
 ## 主要保證
 
@@ -64,10 +64,16 @@ docker compose up -d vllm-cc-proxy
 ```bash
 export ANTHROPIC_BASE_URL='http://127.0.0.1:3456'
 export ANTHROPIC_AUTH_TOKEN="$VLLM_CC_PROXY_API_KEY"
-export ANTHROPIC_MODEL='claude-sonnet-4-5'
+export ANTHROPIC_MODEL='claude-sonnet-4-6'
 ```
 
-模型別名會被解析成 `REAL_MODEL`，預設為 `Ornith-1.0-35B-NVFP4`。此值必須與 vLLM `--served-model-name` 完全一致。
+Proxy 不修改 `model`。Claude Code 傳入的名稱會原樣送到 vLLM，因此 vLLM `--served-model-name` 必須使用完全相同的值，例如：
+
+```text
+--served-model-name claude-sonnet-4-6
+```
+
+`REAL_MODEL` 與 `MODEL_ALIASES_JSON` 已移除；即使殘留在環境中也不會生效。
 
 ## Request policy
 
@@ -82,7 +88,9 @@ max_tokens
 
 合法且由 Claude Code 明確提供的值會保留；缺少或超出範圍時才注入預設值。
 
-Claude Code 的 `thinking.type` 會轉成 vLLM 正式擴充欄位 `chat_template_kwargs.enable_thinking`；原始 `thinking` 物件不會直接送入 vLLM 0.23。`count_tokens` 使用相同的 Thinking 模式，避免模板計數與實際生成不一致。
+僅在 `POST /v1/messages` 中，Claude Code 的 `thinking.type` 會轉成 `chat_template_kwargs.enable_thinking`；原始 `thinking` 物件不會直接送入 vLLM 0.23。
+
+`/v1/messages/count_tokens` 與其他路徑完全透明：Proxy 不解析 JSON、不移除 generation fields、不修改 model，也不插入 Heartbeat。這表示 vLLM 必須能直接接受 Claude Code 對這些路徑送出的原始內容。
 
 以下欄位不會送往 vLLM `/v1/messages`：
 
@@ -158,7 +166,8 @@ bash scripts/verify.sh
 
 測試使用本機 mock vLLM，涵蓋：
 
-- request mapping、sampling 與 auth replacement
+- `/v1/messages` sampling／Thinking policy、model 原值保留與 auth replacement
+- transparent forwarding of count-token／model-discovery／unknown paths
 - heartbeat
 - Thinking Loop 與一次 Recovery
 - fragmented／malformed Tool Call
