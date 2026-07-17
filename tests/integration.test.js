@@ -246,7 +246,8 @@ test('detects a loop in one thinking block, retains one cycle, and returns only 
       return;
     }
     const request = await readJsonRequest(_req).catch(() => null);
-    assert.match(JSON.stringify(request?.system), /repetitive reasoning cycle/i);
+    assert.match(JSON.stringify(request?.system), /Preserve all existing progress/i);
+    assert.match(JSON.stringify(request?.system), /No approved network tool is available/i);
     res.end(messageStart()
       + thinkingBlock(0, 'Recovery chooses the next action.')
       + toolBlock(1, { id: 'toolu_new', name: 'Read', chunks: ['{"file_path":"/work/a"}'] })
@@ -271,6 +272,121 @@ test('detects a loop in one thinking block, retains one cycle, and returns only 
   assert.equal((thinking.match(/Hypothesis A is invalid/g) || []).length, 1);
   assert.match(thinking, /Recovery chooses the next action/);
   assert.deepEqual(toolStarts.map((event) => event.data.content_block.id), ['toolu_new']);
+});
+
+test('loop recovery forces the configured MCP network tool without reopening task state', async (t) => {
+  let attempts = 0;
+  const captured = [];
+  const cycle = 'Re-evaluate the same unresolved hypothesis without new evidence.\n';
+  const mock = await startMockVllm(async (req, res) => {
+    attempts += 1;
+    captured.push(await readJsonRequest(req));
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (attempts === 1) {
+      res.write(messageStart('claude-sonnet-4-6'));
+      res.write(sse('content_block_start', {
+        type: 'content_block_start', index: 0,
+        content_block: { type: 'thinking', thinking: '' },
+      }));
+      res.write(sse('content_block_delta', {
+        type: 'content_block_delta', index: 0,
+        delta: { type: 'thinking_delta', thinking: 'Preserved prefix.\n' + cycle + cycle + cycle },
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      if (!res.destroyed) res.end();
+      return;
+    }
+
+    assert.equal(captured[1].model, 'claude-sonnet-4-6');
+    assert.equal(captured[1].temperature, 0.3);
+    assert.equal(captured[1].max_tokens, 1024);
+    assert.deepEqual(captured[1].tool_choice, {
+      type: 'tool', name: 'mcp__searxng__search',
+    });
+    const system = JSON.stringify(captured[1].system);
+    assert.match(system, /Preserve all existing progress/i);
+    assert.match(system, /Do not restart, re-plan, re-scope, undo, replace, or reconsider completed work/i);
+    assert.match(system, /exactly one complete call/i);
+    assert.doesNotMatch(system, /Active Outcome/i);
+    assert.doesNotMatch(system, /complete the original user request/i);
+
+    res.end(messageStart('claude-sonnet-4-6')
+      + toolBlock(0, {
+        id: 'toolu_network', name: 'mcp__searxng__search',
+        chunks: ['{"query":"current vLLM 0.23 behavior"}'],
+      })
+      + endMessage('tool_use'));
+  });
+  const proxy = await startProxy(mock.baseUrl, {
+    RECOVERY_MCP_SEARCH_TOOL_PRIORITY: 'mcp__searxng__search',
+  });
+  t.after(async () => { await proxy.close(); await mock.close(); });
+
+  const response = await postMessages(proxy.url, {
+    model: 'claude-sonnet-4-6', max_tokens: 8192, temperature: 0.65, stream: true,
+    system: 'Keep prior progress.',
+    messages: [{ role: 'user', content: 'Continue the existing task.' }],
+    tools: [
+      { name: 'Read', input_schema: { type: 'object' } },
+      { name: 'WebSearch', input_schema: { type: 'object' } },
+      { name: 'mcp__searxng__search', input_schema: { type: 'object' } },
+    ],
+    tool_choice: { type: 'auto' },
+  });
+  const events = parseSseText(await response.text());
+  const toolStarts = events.filter((event) => event.data.content_block?.type === 'tool_use');
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(toolStarts.map((event) => event.data.content_block.name), ['mcp__searxng__search']);
+  assert.equal(events.filter((event) => event.data.delta?.type === 'text_delta').length, 0);
+  assert.equal(events.at(-1).event, 'message_stop');
+});
+
+test('forced network recovery rejects a different tool and exposes no partial recovery output', async (t) => {
+  let attempts = 0;
+  const cycle = 'Repeat unresolved reasoning without evidence.\n';
+  const mock = await startMockVllm(async (req, res) => {
+    attempts += 1;
+    await readJsonRequest(req);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (attempts === 1) {
+      res.write(messageStart('claude-sonnet-4-6'));
+      res.write(sse('content_block_start', {
+        type: 'content_block_start', index: 0,
+        content_block: { type: 'thinking', thinking: '' },
+      }));
+      res.write(sse('content_block_delta', {
+        type: 'content_block_delta', index: 0,
+        delta: { type: 'thinking_delta', thinking: cycle + cycle + cycle },
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      if (!res.destroyed) res.end();
+      return;
+    }
+    res.end(messageStart('claude-sonnet-4-6')
+      + toolBlock(0, { id: 'toolu_wrong', name: 'Read', chunks: ['{"file_path":"/tmp/x"}'] })
+      + endMessage('tool_use'));
+  });
+  const proxy = await startProxy(mock.baseUrl, {
+    RECOVERY_MCP_SEARCH_TOOL_PRIORITY: 'mcp__searxng__search',
+  });
+  t.after(async () => { await proxy.close(); await mock.close(); });
+
+  const response = await postMessages(proxy.url, {
+    model: 'claude-sonnet-4-6', max_tokens: 8192, stream: true,
+    messages: [{ role: 'user', content: 'continue' }],
+    tools: [
+      { name: 'Read', input_schema: { type: 'object' } },
+      { name: 'mcp__searxng__search', input_schema: { type: 'object' } },
+    ],
+  });
+  const events = parseSseText(await response.text());
+
+  assert.equal(attempts, 2);
+  assert.equal(events.filter((event) => event.data.content_block?.type === 'tool_use').length, 0);
+  assert.equal(events.filter((event) => event.event === 'message_stop').length, 0);
+  assert.equal(events.at(-1).event, 'error');
+  assert.match(events.at(-1).data.error.message, /recovery contract/i);
 });
 
 test('discards an accidentally truncated first stream and returns a complete recovery', async (t) => {

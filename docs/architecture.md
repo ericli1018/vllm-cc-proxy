@@ -78,7 +78,11 @@ The serializer emits one complete `input_json_delta` per Tool Call.
 
 The original request is immutable. Recovery is produced by `structuredClone` plus request-local overrides. No failed Thinking transcript, text, or Tool Call is inserted into the next request.
 
-For a detected Thinking Loop only, the final response may retain the first attempt's de-duplicated Thinking prefix. All first-attempt text and Tool Calls are discarded. For every other failure, the first response is discarded entirely.
+For a detected Thinking Loop only, `selectRecoveryPlan` inspects exact configured network tool names and completed Tool Results in the original request. A configured MCP search／fetch tool has priority over the configured built-in WebSearch／WebFetch names. When one tool is selected, the recovery request forces exactly that tool through Anthropic `tool_choice`, applies the network sampling cap, and appends a short progress-preservation instruction. The instruction does not introduce an `Active Outcome` or reopen the full task. A post-generation contract check rejects a different tool name, zero or multiple Tool Calls, non-empty Text output, or a non-`tool_use` stop reason before anything is serialized downstream.
+
+Completed fetch results suppress another forced network call only when they are newer than the latest completed search result. Failed Tool Results (`is_error: true`) do not advance the state. Search-to-fetch advancement requires an HTTP(S) URL in a completed configured Search Tool Result.
+
+For a detected Thinking Loop, the final response may retain the first attempt's de-duplicated Thinking prefix. All first-attempt text and Tool Calls are discarded. For every other failure, the first response is discarded entirely and generic recovery is used without network redirection.
 
 ## Concurrency and memory
 

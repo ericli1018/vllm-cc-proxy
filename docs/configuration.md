@@ -12,30 +12,11 @@ All settings are environment variables. Values shown are defaults.
 | `VLLM_BASE_URL` | `http://vllm:8001` | vLLM origin without trailing slash. |
 | `VLLM_API_KEY` | `vllm` | Key sent to vLLM as both Bearer and `x-api-key`. |
 
-## Model and path forwarding
-
-The proxy never rewrites `model`. The value in `POST /v1/messages` is preserved exactly. Configure vLLM `--served-model-name` to match the model selected by Claude Code. Legacy `REAL_MODEL` and `MODEL_ALIASES_JSON` variables are ignored.
-
-Routing behavior:
-
-```text
-POST /v1/messages
-→ managed Anthropic request/SSE path
-
-GET /health/live, GET /health/ready, GET /metrics
-→ proxy-local endpoints
-
-all other method/path/query combinations
-→ raw transparent forwarding to VLLM_BASE_URL
-```
-
-Transparent routes do not receive sampling injection, Thinking mapping, Loop detection, Recovery, or proxy heartbeat frames. Authentication is still checked at the proxy boundary and replaced with `VLLM_API_KEY` upstream.
-
 ## Thinking and sampling
 
 | Variable | Default | Meaning |
 |---|---:|---|
-| `DEFAULT_ENABLE_THINKING` | `true` | Fallback `chat_template_kwargs.enable_thinking`; model names containing `haiku`／`instruct` default to false, and names containing `think` default to true. |
+| `DEFAULT_ENABLE_THINKING` | `true` | Fallback `chat_template_kwargs.enable_thinking`; incoming model names containing `haiku` or `instruct` default to false unless explicitly enabled. |
 | `DEFAULT_TEMPERATURE` | `0.65` | Injected only when incoming value is absent or invalid. |
 | `DEFAULT_TOP_P` | `0.90` | Valid range 0–1. |
 | `DEFAULT_TOP_K` | `40` | Non-negative integer. |
@@ -46,7 +27,7 @@ Request priority for Thinking mode:
 ```text
 Claude thinking.type enabled/disabled
 → explicit chat_template_kwargs.enable_thinking
-→ model-name Thinking heuristic
+→ incoming model-name profile
 → DEFAULT_ENABLE_THINKING
 ```
 
@@ -57,8 +38,38 @@ Claude thinking.type enabled/disabled
 | Variable | Default | Meaning |
 |---|---:|---|
 | `MAX_RECOVERY_ATTEMPTS` | `1` | Allowed range 0–1. |
-| `RECOVERY_TEMPERATURE_MAX` | `0.45` | Upper bound for recovery temperature. |
-| `RECOVERY_MAX_TOKENS` | `4096` | Upper bound for recovery output. |
+| `RECOVERY_TEMPERATURE_MAX` | `0.45` | Upper bound for non-forced recovery temperature. |
+| `RECOVERY_MAX_TOKENS` | `4096` | Upper bound for non-forced recovery output. |
+| `RECOVERY_NETWORK_TEMPERATURE_MAX` | `0.30` | Upper bound when a loop recovery forces one network Tool Call. |
+| `RECOVERY_NETWORK_MAX_TOKENS` | `1024` | Output cap for the forced network Tool Call recovery turn. |
+| `RECOVERY_MCP_SEARCH_TOOL_PRIORITY` | empty | Comma-separated exact MCP search tool names, highest priority first. |
+| `RECOVERY_MCP_FETCH_TOOL_PRIORITY` | empty | Comma-separated exact MCP source-retrieval tool names, highest priority first. |
+| `RECOVERY_WEB_SEARCH_TOOL_NAMES` | `WebSearch` | Comma-separated exact built-in／gateway search tool names. |
+| `RECOVERY_WEB_FETCH_TOOL_NAMES` | `WebFetch` | Comma-separated exact built-in／gateway fetch tool names. |
+
+### Recovery selection
+
+Network-first selection is applied only when the first attempt is classified as a Thinking Loop. Transport interruption, malformed SSE, incomplete Tool Call, and other structural failures use generic regeneration and are not redirected to network research.
+
+The Proxy uses exact tool names from the current request. It never invents a missing tool and does not infer arbitrary MCP tools from a substring such as `search` or `fetch`.
+
+```text
+completed configured fetch result newer than latest search
+→ no forced network call; preserve state and continue from retrieved input
+
+URL-bearing configured search result
+→ configured MCP fetch
+→ configured WebFetch
+
+otherwise
+→ configured MCP search
+→ configured WebSearch
+→ evidence fallback without a forced network tool
+```
+
+A `tool_result` with `is_error: true` is ignored for state advancement. URL detection is limited to HTTP(S) URLs found in completed configured search Tool Results. A completed fetch result is only treated as retrieved input, not as a verified or authoritative conclusion.
+
+During a forced network recovery, the Proxy sets Anthropic `tool_choice` to the selected existing tool and appends a short Ornith-specific control prompt. That prompt preserves completed progress, prohibits restart／re-plan／re-scope／undo, and permits only one complete call to the selected tool. It does not create an `Active Outcome` or summarize the original task. The completed recovery is accepted only when it contains exactly one Tool Call with the selected name, no non-empty Text block, and `stop_reason=tool_use`.
 
 ## Heartbeat and deadlines
 
@@ -76,7 +87,7 @@ Claude thinking.type enabled/disabled
 | Variable | Default | Meaning |
 |---|---:|---|
 | `MAX_ACTIVE_REQUESTS` | `2000` | Per-instance admission limit covering streaming, non-streaming, and count-token calls. |
-| `MAX_REQUEST_BODY_BYTES` | `8388608` | Managed `POST /v1/messages` JSON limit; transparent routes are streamed without body buffering. |
+| `MAX_REQUEST_BODY_BYTES` | `8388608` | Request JSON limit. |
 | `MAX_RESPONSE_BUFFER_BYTES` | `33554432` | Per-attempt raw SSE parser limit. |
 | `MAX_TOTAL_BUFFERED_BYTES` | `2147483648` | Process-wide active raw SSE reservation limit. |
 | `MAX_THINKING_BYTES` | `4194304` | Per Thinking block. |

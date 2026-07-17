@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   applyRequestPolicy,
   loadConfig,
+  selectRecoveryPlan,
 } from '../vllm-cc-proxy.js';
 
 test('loadConfig ignores legacy model alias environment variables', () => {
@@ -179,4 +180,252 @@ test('haiku model name defaults to non-thinking for background work', () => {
   }, config);
 
   assert.equal(output.chat_template_kwargs.enable_thinking, false);
+});
+
+
+test('loadConfig parses exact MCP-first recovery tool priorities and network sampling limits', () => {
+  const config = loadConfig({
+    RECOVERY_MCP_SEARCH_TOOL_PRIORITY: 'mcp__searxng__search, mcp__brave__search',
+    RECOVERY_MCP_FETCH_TOOL_PRIORITY: 'mcp__fetch__fetch',
+    RECOVERY_WEB_SEARCH_TOOL_NAMES: 'WebSearch,CustomWebSearch',
+    RECOVERY_WEB_FETCH_TOOL_NAMES: 'WebFetch,CustomWebFetch',
+    RECOVERY_NETWORK_TEMPERATURE_MAX: '0.25',
+    RECOVERY_NETWORK_MAX_TOKENS: '768',
+  });
+
+  assert.deepEqual(config.recoveryMcpSearchToolPriority, [
+    'mcp__searxng__search',
+    'mcp__brave__search',
+  ]);
+  assert.deepEqual(config.recoveryMcpFetchToolPriority, ['mcp__fetch__fetch']);
+  assert.deepEqual(config.recoveryWebSearchToolNames, ['WebSearch', 'CustomWebSearch']);
+  assert.deepEqual(config.recoveryWebFetchToolNames, ['WebFetch', 'CustomWebFetch']);
+  assert.equal(config.recoveryNetworkTemperatureMax, 0.25);
+  assert.equal(config.recoveryNetworkMaxTokens, 768);
+});
+
+test('selectRecoveryPlan prefers configured MCP search over built-in WebSearch and WebFetch', () => {
+  const config = loadConfig({
+    RECOVERY_MCP_SEARCH_TOOL_PRIORITY: 'mcp__searxng__search',
+    RECOVERY_MCP_FETCH_TOOL_PRIORITY: 'mcp__fetch__fetch',
+  });
+  const input = {
+    model: 'claude-sonnet-4-6',
+    messages: [{ role: 'user', content: 'check current behavior' }],
+    tools: [
+      { name: 'WebFetch', input_schema: { type: 'object' } },
+      { name: 'WebSearch', input_schema: { type: 'object' } },
+      { name: 'mcp__searxng__search', input_schema: { type: 'object' } },
+      { name: 'mcp__fetch__fetch', input_schema: { type: 'object' } },
+    ],
+  };
+
+  const plan = selectRecoveryPlan(input, config, { kind: 'loop', reason: 'abab_reasoning_loop' });
+
+  assert.equal(plan.mode, 'network_search');
+  assert.equal(plan.selectedTool, 'mcp__searxng__search');
+  assert.match(plan.instruction, /Preserve all existing progress/i);
+  assert.match(plan.instruction, /Do not restart, re-plan, re-scope, undo, replace, or reconsider completed work/i);
+  assert.match(plan.instruction, /exactly one complete call/i);
+  assert.doesNotMatch(plan.instruction, /Active Outcome/i);
+  assert.doesNotMatch(plan.instruction, /complete the original user request/i);
+});
+
+test('selectRecoveryPlan prefers configured MCP fetch when a completed search result exposes a URL', () => {
+  const config = loadConfig({
+    RECOVERY_MCP_SEARCH_TOOL_PRIORITY: 'mcp__searxng__search',
+    RECOVERY_MCP_FETCH_TOOL_PRIORITY: 'mcp__fetch__fetch',
+  });
+  const input = {
+    messages: [
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use', id: 'toolu_search', name: 'mcp__searxng__search', input: { query: 'vllm' },
+        }],
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result', tool_use_id: 'toolu_search',
+          content: 'Official docs: https://docs.vllm.ai/en/latest/',
+        }],
+      },
+    ],
+    tools: [
+      { name: 'mcp__searxng__search', input_schema: { type: 'object' } },
+      { name: 'mcp__fetch__fetch', input_schema: { type: 'object' } },
+      { name: 'WebFetch', input_schema: { type: 'object' } },
+    ],
+  };
+
+  const plan = selectRecoveryPlan(input, config, { kind: 'loop', reason: 'reasoning_without_action' });
+
+  assert.equal(plan.mode, 'network_fetch');
+  assert.equal(plan.selectedTool, 'mcp__fetch__fetch');
+});
+
+test('selectRecoveryPlan uses WebFetch after a URL-bearing WebSearch result when no MCP tool is configured', () => {
+  const config = loadConfig({});
+  const input = {
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_search', name: 'WebSearch', input: { query: 'x' } }],
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result', tool_use_id: 'toolu_search', content: [{ type: 'text', text: 'https://example.com/source' }],
+        }],
+      },
+    ],
+    tools: [
+      { name: 'WebSearch', input_schema: { type: 'object' } },
+      { name: 'WebFetch', input_schema: { type: 'object' } },
+    ],
+  };
+
+  const plan = selectRecoveryPlan(input, config, { kind: 'loop', reason: 'repeated_reasoning_segment' });
+
+  assert.equal(plan.mode, 'network_fetch');
+  assert.equal(plan.selectedTool, 'WebFetch');
+});
+
+test('selectRecoveryPlan falls back to WebSearch and never invents an absent network tool', () => {
+  const config = loadConfig({
+    RECOVERY_MCP_SEARCH_TOOL_PRIORITY: 'mcp__missing__search',
+    RECOVERY_MCP_FETCH_TOOL_PRIORITY: 'mcp__missing__fetch',
+  });
+  const withWebSearch = selectRecoveryPlan({
+    messages: [],
+    tools: [{ name: 'WebSearch', input_schema: { type: 'object' } }],
+  }, config, { kind: 'loop', reason: 'zero_delta_correction' });
+  const withoutNetwork = selectRecoveryPlan({
+    messages: [],
+    tools: [{ name: 'Read', input_schema: { type: 'object' } }],
+  }, config, { kind: 'loop', reason: 'zero_delta_correction' });
+
+  assert.equal(withWebSearch.mode, 'network_search');
+  assert.equal(withWebSearch.selectedTool, 'WebSearch');
+  assert.equal(withoutNetwork.mode, 'evidence_fallback');
+  assert.equal(withoutNetwork.selectedTool, null);
+  assert.match(withoutNetwork.instruction, /Do not invent a network tool/i);
+});
+
+test('selectRecoveryPlan does not force another network call after newer completed fetch evidence', () => {
+  const config = loadConfig({
+    RECOVERY_MCP_SEARCH_TOOL_PRIORITY: 'mcp__searxng__search',
+    RECOVERY_MCP_FETCH_TOOL_PRIORITY: 'mcp__fetch__fetch',
+  });
+  const input = {
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_search', name: 'mcp__searxng__search', input: {} }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_search', content: 'https://docs.example/a' }],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_fetch', name: 'mcp__fetch__fetch', input: {} }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_fetch', content: 'authoritative source body' }],
+      },
+    ],
+    tools: [
+      { name: 'mcp__searxng__search', input_schema: { type: 'object' } },
+      { name: 'mcp__fetch__fetch', input_schema: { type: 'object' } },
+    ],
+  };
+
+  const plan = selectRecoveryPlan(input, config, { kind: 'loop', reason: 'semantic_stall_timeout' });
+
+  assert.equal(plan.mode, 'evidence_available');
+  assert.equal(plan.selectedTool, null);
+  assert.match(plan.instruction, /completed configured source-retrieval result is present/i);
+  assert.match(plan.instruction, /not a verified conclusion/i);
+  assert.match(plan.instruction, /Do not treat source retrieval as completion/i);
+});
+
+test('selectRecoveryPlan keeps non-loop recovery generic and does not redirect transport failures to research', () => {
+  const config = loadConfig({ RECOVERY_MCP_SEARCH_TOOL_PRIORITY: 'mcp__searxng__search' });
+  const input = {
+    messages: [],
+    tools: [{ name: 'mcp__searxng__search', input_schema: { type: 'object' } }],
+  };
+
+  const plan = selectRecoveryPlan(input, config, {
+    kind: 'invalid', reason: 'upstream_stream_interrupted',
+  });
+
+  assert.equal(plan.mode, 'generic_regeneration');
+  assert.equal(plan.selectedTool, null);
+  assert.doesNotMatch(plan.instruction, /Required tool/i);
+  assert.doesNotMatch(plan.instruction, /network/i);
+});
+
+test('applyRequestPolicy applies forced network recovery tool choice and tighter sampling without changing model', () => {
+  const config = loadConfig({
+    RECOVERY_NETWORK_TEMPERATURE_MAX: '0.3',
+    RECOVERY_NETWORK_MAX_TOKENS: '1024',
+  });
+  const input = {
+    model: 'claude-sonnet-4-6',
+    temperature: 0.65,
+    max_tokens: 8192,
+    system: 'base',
+    messages: [{ role: 'user', content: 'research' }],
+    tools: [{ name: 'WebSearch', input_schema: { type: 'object' } }],
+    tool_choice: { type: 'auto' },
+  };
+  const plan = {
+    mode: 'network_search',
+    selectedTool: 'WebSearch',
+    instruction: '[RECOVERY CONTROL] Preserve all existing progress.',
+  };
+
+  const output = applyRequestPolicy(input, config, { recoveryPlan: plan });
+
+  assert.equal(output.model, 'claude-sonnet-4-6');
+  assert.equal(output.temperature, 0.3);
+  assert.equal(output.max_tokens, 1024);
+  assert.deepEqual(output.tool_choice, { type: 'tool', name: 'WebSearch' });
+  assert.match(JSON.stringify(output.system), /Preserve all existing progress/);
+});
+
+
+test('selectRecoveryPlan ignores failed network tool results when classifying recovery state', () => {
+  const config = loadConfig({
+    RECOVERY_MCP_SEARCH_TOOL_PRIORITY: 'mcp__searxng__search',
+    RECOVERY_MCP_FETCH_TOOL_PRIORITY: 'mcp__fetch__fetch',
+  });
+  const input = {
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_fetch', name: 'mcp__fetch__fetch', input: {} }],
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result', tool_use_id: 'toolu_fetch', is_error: true,
+          content: 'fetch failed for https://docs.example/a',
+        }],
+      },
+    ],
+    tools: [
+      { name: 'mcp__searxng__search', input_schema: { type: 'object' } },
+      { name: 'mcp__fetch__fetch', input_schema: { type: 'object' } },
+    ],
+  };
+
+  const plan = selectRecoveryPlan(input, config, { kind: 'loop', reason: 'semantic_stall_timeout' });
+
+  assert.equal(plan.mode, 'network_search');
+  assert.equal(plan.selectedTool, 'mcp__searxng__search');
 });

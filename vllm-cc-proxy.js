@@ -45,6 +45,21 @@ function trimTrailingSlash(value) {
   return String(value).replace(/\/+$/, '');
 }
 
+function parseNameList(value, defaults = []) {
+  const source = value === undefined || value === null || value === ''
+    ? defaults
+    : String(value).split(',');
+  const seen = new Set();
+  const output = [];
+  for (const item of source) {
+    const name = String(item).trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    output.push(name);
+  }
+  return output;
+}
+
 export function loadConfig(env = process.env) {
   return Object.freeze({
     host: env.PROXY_HOST || '0.0.0.0',
@@ -61,6 +76,12 @@ export function loadConfig(env = process.env) {
     defaultEnableThinking: parseBoolean(env.DEFAULT_ENABLE_THINKING, true),
     recoveryTemperatureMax: parseNumber(env.RECOVERY_TEMPERATURE_MAX, 0.45, { min: 0, max: 2 }),
     recoveryMaxTokens: parseInteger(env.RECOVERY_MAX_TOKENS, 4096, { min: 1 }),
+    recoveryNetworkTemperatureMax: parseNumber(env.RECOVERY_NETWORK_TEMPERATURE_MAX, 0.30, { min: 0, max: 2 }),
+    recoveryNetworkMaxTokens: parseInteger(env.RECOVERY_NETWORK_MAX_TOKENS, 1024, { min: 1 }),
+    recoveryMcpSearchToolPriority: Object.freeze(parseNameList(env.RECOVERY_MCP_SEARCH_TOOL_PRIORITY)),
+    recoveryMcpFetchToolPriority: Object.freeze(parseNameList(env.RECOVERY_MCP_FETCH_TOOL_PRIORITY)),
+    recoveryWebSearchToolNames: Object.freeze(parseNameList(env.RECOVERY_WEB_SEARCH_TOOL_NAMES, ['WebSearch'])),
+    recoveryWebFetchToolNames: Object.freeze(parseNameList(env.RECOVERY_WEB_FETCH_TOOL_NAMES, ['WebFetch'])),
     maxRecoveryAttempts: parseInteger(env.MAX_RECOVERY_ATTEMPTS, 1, { min: 0, max: 1 }),
     heartbeatIntervalMs: parseInteger(env.HEARTBEAT_INTERVAL_MS, 10000, { min: 1000 }),
     maxActiveRequests: parseInteger(env.MAX_ACTIVE_REQUESTS, 2000, { min: 1 }),
@@ -112,25 +133,209 @@ function applyThinkingPolicy(body, originalModel, config) {
   };
 }
 
-function appendRecoveryInstruction(system, reason) {
-  const text = [
-    'The previous generation entered a repetitive reasoning cycle or produced an incomplete response.',
-    'Continue from the original user request and existing tool results only.',
-    'Do not repeat prior hypotheses without new evidence.',
-    'Produce the next concrete tool call or a final response.',
-    `Recovery reason: ${reason}.`,
-  ].join(' ');
-
+function appendSystemInstruction(system, text) {
   if (typeof system === 'string') return `${system}\n\n${text}`;
   if (Array.isArray(system)) return [...system, { type: 'text', text }];
   return [{ type: 'text', text }];
+}
+
+function contentToText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map(contentToText).filter(Boolean).join('\n');
+  if (!content || typeof content !== 'object') return '';
+  if (typeof content.text === 'string') return content.text;
+  if (Object.hasOwn(content, 'content')) return contentToText(content.content);
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return '';
+  }
+}
+
+function firstAvailable(priority, available) {
+  return priority.find((name) => available.has(name)) || null;
+}
+
+function inspectNetworkToolHistory(input, config) {
+  const searchNames = new Set([
+    ...config.recoveryMcpSearchToolPriority,
+    ...config.recoveryWebSearchToolNames,
+  ]);
+  const fetchNames = new Set([
+    ...config.recoveryMcpFetchToolPriority,
+    ...config.recoveryWebFetchToolNames,
+  ]);
+  const toolUses = new Map();
+  const results = [];
+  let sequence = 0;
+
+  for (const message of Array.isArray(input?.messages) ? input.messages : []) {
+    const blocks = Array.isArray(message?.content) ? message.content : [];
+    for (const block of blocks) {
+      sequence += 1;
+      if (block?.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+        toolUses.set(block.id, { name: block.name, sequence });
+        continue;
+      }
+      if (block?.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+      if (block.is_error === true) continue;
+      const use = toolUses.get(block.tool_use_id);
+      if (!use) continue;
+      let kind = null;
+      if (searchNames.has(use.name)) kind = 'search';
+      if (fetchNames.has(use.name)) kind = 'fetch';
+      if (!kind) continue;
+      const text = contentToText(block.content);
+      results.push({
+        kind,
+        name: use.name,
+        sequence,
+        hasUrl: /https?:\/\/[^\s<>'"`]+/i.test(text),
+      });
+    }
+  }
+
+  const latestSearch = results.filter((result) => result.kind === 'search').at(-1) || null;
+  const latestFetch = results.filter((result) => result.kind === 'fetch').at(-1) || null;
+  return { latestSearch, latestFetch };
+}
+
+function buildForcedNetworkInstruction(reason, selectedTool) {
+  return [
+    '[RECOVERY CONTROL]',
+    'This is a recovery generation for the current assistant turn.',
+    'The task state established before the failed generation remains authoritative.',
+    'Preserve all existing progress.',
+    'Do not restart, re-plan, re-scope, undo, replace, or reconsider completed work.',
+    'Only the unresolved blocker that caused the reasoning loop is open.',
+    `Recovery reason: ${reason}.`,
+    `Required tool: ${selectedTool}.`,
+    `Emit exactly one complete call to ${selectedTool} to obtain missing current external evidence for that blocker.`,
+    'Do not emit analysis, planning, explanation, conclusions, final text, completion claims, or any other tool call.',
+    'Do not change existing task state before the real tool result is returned.',
+  ].join('\n');
+}
+
+function buildEvidenceAvailableInstruction(reason) {
+  return [
+    '[RECOVERY CONTROL]',
+    'This is a recovery generation for the current assistant turn.',
+    'The task state established before the failed generation remains authoritative.',
+    'Preserve all existing progress.',
+    'Do not restart, re-plan, re-scope, undo, replace, or reconsider completed work.',
+    'A completed configured source-retrieval result is present in the request messages.',
+    'Treat that result as evidence input, not a verified conclusion.',
+    'Use it only to resolve the blocker that caused the reasoning loop, then take the smallest next necessary action.',
+    'Do not repeat network search or source retrieval merely because recovery was triggered.',
+    'Do not treat source retrieval as completion of research or completion of the task.',
+    'Do not reopen completed work unless new direct evidence specifically contradicts an unverified provisional assumption.',
+    `Recovery reason: ${reason}.`,
+  ].join('\n');
+}
+
+function buildEvidenceFallbackInstruction(reason) {
+  return [
+    '[RECOVERY CONTROL]',
+    'This is a recovery generation for the current assistant turn.',
+    'The task state established before the failed generation remains authoritative.',
+    'Preserve all existing progress.',
+    'Do not restart, re-plan, re-scope, undo, replace, or reconsider completed work.',
+    'No approved network tool is available in the current request. Do not invent a network tool or external evidence.',
+    'Use the smallest available evidence-producing action for only the unresolved blocker.',
+    'If no available tool can produce new evidence, identify the exact missing evidence without guessing or claiming completion.',
+    `Recovery reason: ${reason}.`,
+  ].join('\n');
+}
+
+function buildGenericRecoveryInstruction(reason) {
+  return [
+    '[RECOVERY CONTROL]',
+    'The previous generation was incomplete or structurally invalid.',
+    'The task state established before that failed generation remains authoritative.',
+    'Preserve all completed progress and existing tool results.',
+    'Do not assume that partial text or partial tool calls from the failed generation were executed.',
+    'Regenerate only the current assistant turn without restarting, re-planning, re-scoping, undoing, or replacing completed work.',
+    `Recovery reason: ${reason}.`,
+  ].join('\n');
+}
+
+export function selectRecoveryPlan(input, config, { kind, reason }) {
+  const normalizedReason = typeof reason === 'string' && reason ? reason : 'unknown_recovery_reason';
+  if (kind !== 'loop') {
+    return {
+      mode: 'generic_regeneration',
+      selectedTool: null,
+      instruction: buildGenericRecoveryInstruction(normalizedReason),
+    };
+  }
+
+  const available = new Set(
+    (Array.isArray(input?.tools) ? input.tools : [])
+      .map((tool) => tool?.name)
+      .filter((name) => typeof name === 'string' && name),
+  );
+  const { latestSearch, latestFetch } = inspectNetworkToolHistory(input, config);
+
+  if (latestFetch && (!latestSearch || latestFetch.sequence > latestSearch.sequence)) {
+    return {
+      mode: 'evidence_available',
+      selectedTool: null,
+      instruction: buildEvidenceAvailableInstruction(normalizedReason),
+    };
+  }
+
+  if (latestSearch?.hasUrl) {
+    const selectedFetch = firstAvailable(config.recoveryMcpFetchToolPriority, available)
+      || firstAvailable(config.recoveryWebFetchToolNames, available);
+    if (selectedFetch) {
+      return {
+        mode: 'network_fetch',
+        selectedTool: selectedFetch,
+        instruction: buildForcedNetworkInstruction(normalizedReason, selectedFetch),
+      };
+    }
+  }
+
+  const selectedSearch = firstAvailable(config.recoveryMcpSearchToolPriority, available)
+    || firstAvailable(config.recoveryWebSearchToolNames, available);
+  if (selectedSearch) {
+    return {
+      mode: 'network_search',
+      selectedTool: selectedSearch,
+      instruction: buildForcedNetworkInstruction(normalizedReason, selectedSearch),
+    };
+  }
+
+  return {
+    mode: 'evidence_fallback',
+    selectedTool: null,
+    instruction: buildEvidenceFallbackInstruction(normalizedReason),
+  };
+}
+
+function validateRecoveryContract(result, recoveryPlan) {
+  if (!recoveryPlan?.selectedTool) return { ok: true };
+  const blocks = Array.isArray(result?.blocks) ? result.blocks : [];
+  const toolBlocks = blocks.filter((block) => block.type === 'tool_use');
+  if (toolBlocks.length !== 1) {
+    return { ok: false, reason: 'forced_network_tool_count_mismatch' };
+  }
+  if (toolBlocks[0].name !== recoveryPlan.selectedTool) {
+    return { ok: false, reason: 'forced_network_tool_name_mismatch' };
+  }
+  const hasText = blocks.some((block) => block.type === 'text' && String(block.text || '').trim());
+  if (hasText) return { ok: false, reason: 'forced_network_recovery_emitted_text' };
+  if (result.stopReason !== 'tool_use') {
+    return { ok: false, reason: 'forced_network_recovery_stop_reason_mismatch' };
+  }
+  return { ok: true };
 }
 
 function removeUnsupportedFields(body) {
   for (const key of UNSUPPORTED_ANTHROPIC_REQUEST_FIELDS) delete body[key];
 }
 
-export function applyRequestPolicy(input, config, { recoveryReason = null } = {}) {
+export function applyRequestPolicy(input, config, { recoveryReason = null, recoveryPlan = null } = {}) {
   const body = structuredClone(input);
   const originalModel = body.model;
   applyThinkingPolicy(body, originalModel, config);
@@ -149,10 +354,33 @@ export function applyRequestPolicy(input, config, { recoveryReason = null } = {}
   };
   Object.assign(body, validatedSampling);
 
-  if (recoveryReason) {
-    body.temperature = Math.min(Number(body.temperature), config.recoveryTemperatureMax);
-    body.max_tokens = Math.min(Number(body.max_tokens), config.recoveryMaxTokens);
-    body.system = appendRecoveryInstruction(body.system, recoveryReason);
+  const effectiveRecoveryPlan = recoveryPlan || (recoveryReason
+    ? {
+      mode: 'generic_regeneration',
+      selectedTool: null,
+      instruction: [
+        'The previous generation entered a repetitive reasoning cycle or produced an incomplete response.',
+        buildGenericRecoveryInstruction(recoveryReason),
+      ].join('\n'),
+    }
+    : null);
+
+  if (effectiveRecoveryPlan) {
+    const forcedNetworkTool = effectiveRecoveryPlan.selectedTool;
+    const temperatureMax = forcedNetworkTool
+      ? config.recoveryNetworkTemperatureMax
+      : config.recoveryTemperatureMax;
+    const maxTokens = forcedNetworkTool
+      ? config.recoveryNetworkMaxTokens
+      : config.recoveryMaxTokens;
+    body.temperature = Math.min(Number(body.temperature), temperatureMax);
+    body.max_tokens = Math.min(Number(body.max_tokens), maxTokens);
+    body.system = appendSystemInstruction(body.system, effectiveRecoveryPlan.instruction);
+    if (forcedNetworkTool) {
+      const toolExists = Array.isArray(body.tools)
+        && body.tools.some((tool) => tool?.name === forcedNetworkTool);
+      if (toolExists) body.tool_choice = { type: 'tool', name: forcedNetworkTool };
+    }
   }
 
   return body;
@@ -1648,7 +1876,18 @@ export function createProxyServer(config = loadConfig()) {
           metrics.toolValidationFailuresTotal += 1;
         }
         context.transition('RECOVERING');
-        const recoveryBody = applyRequestPolicy(input, config, { recoveryReason: first.reason });
+        const recoveryPlan = selectRecoveryPlan(input, config, {
+          kind: first.kind,
+          reason: first.reason,
+        });
+        const recoveryBody = applyRequestPolicy(input, config, { recoveryPlan });
+        logEvent(config, {
+          event: 'recovery_started',
+          request_id: requestId,
+          recovery_mode: recoveryPlan.mode,
+          selected_tool: recoveryPlan.selectedTool,
+          reason: first.reason,
+        });
         const recovery = await performStreamingAttempt({
           body: recoveryBody,
           request,
@@ -1658,6 +1897,14 @@ export function createProxyServer(config = loadConfig()) {
         });
         if (context.terminal) return;
         if (recovery.kind === 'success') {
+          const recoveryContract = validateRecoveryContract(recovery.result, recoveryPlan);
+          if (!recoveryContract.ok) {
+            return await sendSseError(
+              context,
+              'api_error',
+              `Recovery contract validation failed: ${recoveryContract.reason}.`,
+            );
+          }
           metrics.recoverySuccessTotal += 1;
           finalResult = first.kind === 'loop'
             ? mergeRecovery(first.result, recovery.result, first.loopInfo)

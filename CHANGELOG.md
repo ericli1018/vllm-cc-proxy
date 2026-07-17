@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 - 2026-07-17
+
+- Added Ornith-specific, progress-preserving Recovery control for Thinking Loops.
+- Added deterministic MCP-first network Tool selection using exact configured tool names from the current request.
+- Added search-result／fetch-result state inspection, HTTP(S) URL gating, and `is_error` rejection.
+- Forced exactly one selected network Tool Call through Anthropic `tool_choice` with tighter Recovery sampling limits and post-generation contract validation.
+- Kept transport, SSE, and malformed Tool Call recovery generic; these failures no longer imply network research.
+- Explicitly prohibited Recovery from creating an Active Outcome, restarting, re-planning, re-scoping, undoing, replacing, or concluding the full task.
+- Added unit and end-to-end integration tests for MCP priority, WebSearch／WebFetch fallback, no invented tools, source-result state, model preservation, and Recovery-only Tool output.
+
 ## 0.2.0 - 2026-07-17
 
 - Removed all model alias and `REAL_MODEL` behavior; `/v1/messages` now preserves the client model exactly.
