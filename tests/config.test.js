@@ -669,3 +669,75 @@ test('recovery injects its temperature cap when normal request omitted temperatu
   assert.equal(output.temperature, 0.45);
   assert.equal(output.max_tokens, 4096);
 });
+
+test('selectRecoveryPlan repairs a rejected no-op edit by forcing Read of the same target file', () => {
+  const config = loadConfig({});
+  const input = {
+    messages: [{ role: 'user', content: 'Apply the TLS fix.' }],
+    tools: [
+      { name: 'Read', description: 'Read a local file.', input_schema: { type: 'object' } },
+      { name: 'Update', description: 'Replace exact text.', input_schema: { type: 'object' } },
+    ],
+  };
+  const failedResult = {
+    blocks: [{
+      type: 'tool_use',
+      name: 'Update',
+      input: {
+        file_path: '/work/src/tls_common.h',
+        old_string: 'same',
+        new_string: 'same',
+      },
+    }],
+  };
+
+  const plan = selectRecoveryPlan(input, config, {
+    kind: 'invalid',
+    reason: 'no_op_edit_tool_call',
+    failedResult,
+  });
+  const output = applyRequestPolicy(input, config, { recoveryPlan: plan });
+
+  assert.equal(plan.mode, 'edit_repair_read');
+  assert.equal(plan.selectedTool, 'Read');
+  assert.deepEqual(plan.allowedTools, ['Read']);
+  assert.deepEqual(output.tools.map((tool) => tool.name), ['Read']);
+  assert.deepEqual(output.tool_choice, { type: 'tool', name: 'Read' });
+  assert.equal(output.temperature, 0.45);
+  assert.equal(output.max_tokens, 4096);
+  assert.match(JSON.stringify(output.system), /old_string and new_string were identical/i);
+  assert.match(JSON.stringify(output.system), /\/work\/src\/tls_common\.h/);
+});
+
+test('selectRecoveryPlan retries a corrected edit instead of re-reading when the latest successful result already read the target file', () => {
+  const config = loadConfig({});
+  const targetPath = '/work/src/tls_common.h';
+  const input = {
+    messages: [
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_read', name: 'Read', input: { file_path: targetPath } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_read', content: 'current file body' }] },
+    ],
+    tools: [
+      { name: 'Read', description: 'Read a local file.', input_schema: { type: 'object' } },
+      { name: 'Update', description: 'Replace exact text.', input_schema: { type: 'object' } },
+    ],
+  };
+  const failedResult = {
+    blocks: [{
+      type: 'tool_use', name: 'Update',
+      input: { file_path: targetPath, old_string: 'same', new_string: 'same' },
+    }],
+  };
+
+  const plan = selectRecoveryPlan(input, config, {
+    kind: 'invalid', reason: 'no_op_edit_tool_call', failedResult,
+  });
+  const output = applyRequestPolicy(input, config, { recoveryPlan: plan });
+
+  assert.equal(plan.mode, 'edit_repair_retry');
+  assert.equal(plan.selectedTool, 'Update');
+  assert.deepEqual(output.tools.map((tool) => tool.name), ['Update']);
+  assert.deepEqual(output.tool_choice, { type: 'tool', name: 'Update' });
+  assert.match(JSON.stringify(output.system), /corrected edit/i);
+  assert.match(JSON.stringify(output.system), /new_string must be different/i);
+});

@@ -292,3 +292,91 @@ test('validation rejects a completed response that contains thinking but no fina
   assert.equal(validation.ok, false);
   assert.equal(validation.reason, 'thinking_without_output');
 });
+
+test('validation rejects no-op Edit or Update calls whose old_string and new_string are identical', () => {
+  const stream = baseStart()
+    + frame('content_block_start', {
+      type: 'content_block_start', index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_noop', name: 'Update', input: {} },
+    })
+    + frame('content_block_delta', {
+      type: 'content_block_delta', index: 0,
+      delta: {
+        type: 'input_json_delta',
+        partial_json: JSON.stringify({
+          file_path: '/work/src/tls_common.h',
+          old_string: 'same text',
+          new_string: 'same text',
+        }),
+      },
+    })
+    + frame('content_block_stop', { type: 'content_block_stop', index: 0 })
+    + finish('tool_use');
+
+  const validation = validateAttempt(parseInFragments(stream), loadConfig({}));
+  assert.equal(validation.ok, false);
+  assert.equal(validation.reason, 'no_op_edit_tool_call');
+});
+
+test('validation accepts a meaningful Edit call whose replacement differs', () => {
+  const stream = baseStart()
+    + frame('content_block_start', {
+      type: 'content_block_start', index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_edit', name: 'Edit', input: {} },
+    })
+    + frame('content_block_delta', {
+      type: 'content_block_delta', index: 0,
+      delta: {
+        type: 'input_json_delta',
+        partial_json: JSON.stringify({
+          file_path: '/work/src/tls_common.h',
+          old_string: 'before',
+          new_string: 'after',
+        }),
+      },
+    })
+    + frame('content_block_stop', { type: 'content_block_stop', index: 0 })
+    + finish('tool_use');
+
+  assert.equal(validateAttempt(parseInFragments(stream), loadConfig({})).ok, true);
+});
+
+test('validation rejects an identical edit call that already failed in request history', () => {
+  const toolInput = {
+    file_path: '/work/src/tls_common.h',
+    old_string: 'before',
+    new_string: 'after',
+  };
+  const requestInput = {
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_previous', name: 'Edit', input: toolInput }],
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'toolu_previous',
+          is_error: true,
+          content: 'Error: old_string was not found',
+        }],
+      },
+    ],
+  };
+  const stream = baseStart()
+    + frame('content_block_start', {
+      type: 'content_block_start', index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_repeat', name: 'Edit', input: {} },
+    })
+    + frame('content_block_delta', {
+      type: 'content_block_delta', index: 0,
+      delta: { type: 'input_json_delta', partial_json: JSON.stringify(toolInput) },
+    })
+    + frame('content_block_stop', { type: 'content_block_stop', index: 0 })
+    + finish('tool_use');
+
+  const validation = validateAttempt(parseInFragments(stream), loadConfig({}), requestInput);
+  assert.equal(validation.ok, false);
+  assert.equal(validation.reason, 'repeated_failed_edit_tool_call');
+});

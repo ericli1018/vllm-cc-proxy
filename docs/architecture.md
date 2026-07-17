@@ -76,13 +76,17 @@ A Tool Call is eligible for output only after:
 - `id` and `name` are non-empty;
 - every `partial_json` fragment was received in order;
 - combined JSON passes `JSON.parse`;
-- response `stop_reason` is consistent with emitted tools.
+- response `stop_reason` is consistent with emitted tools;
+- Edit-like input does not have identical `old_string`／`new_string`;
+- an Edit-like call does not exactly repeat a canonicalized call already paired with `is_error:true` in request history.
 
 The serializer emits one complete `input_json_delta` per Tool Call.
 
 ## Recovery
 
 The original request is immutable. Recovery is produced by `structuredClone` plus request-local overrides. No failed Thinking transcript, text, or Tool Call is inserted into the next request.
+
+For `no_op_edit_tool_call` or `repeated_failed_edit_tool_call`, recovery is local and Edit-specific. The rejected Tool Call is never serialized. If the latest successful Tool Result is not already a local Read of the same `file_path`, the proxy filters recovery tools to the detected local Read tool and forces one Read call. Once the latest successful result is a Read of that file, recovery instead forces the original Edit／Update tool and requires a corrected non-identical replacement. This prevents a repeated Read-only cycle while keeping the repair limited to the current edit blocker.
 
 For a detected Thinking Loop only, `selectRecoveryPlan` inspects completed Tool Results and builds a Search or Fetch recovery stage. Exact configured MCP priority names are checked first. In default `auto` mode, if no configured MCP name is available, the proxy conservatively classifies current tools from their name, description, and input schema. MCP candidates suppress non-MCP candidates within the same stage.
 

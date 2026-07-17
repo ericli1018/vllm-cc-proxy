@@ -168,6 +168,98 @@ function toolDefinitions(input) {
     .filter((tool) => tool && typeof tool === 'object' && typeof tool.name === 'string' && tool.name);
 }
 
+function canonicalJsonValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue);
+  if (!value || typeof value !== 'object') return value;
+  const output = {};
+  for (const key of Object.keys(value).sort()) output[key] = canonicalJsonValue(value[key]);
+  return output;
+}
+
+function toolCallFingerprint(name, input) {
+  const canonical = JSON.stringify({ name: String(name || ''), input: canonicalJsonValue(input || {}) });
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
+function editToolInfo(block) {
+  if (!block || block.type !== 'tool_use' || !block.input || typeof block.input !== 'object' || Array.isArray(block.input)) {
+    return null;
+  }
+  const { old_string: oldString, new_string: newString } = block.input;
+  if (typeof oldString !== 'string' || typeof newString !== 'string') return null;
+  return {
+    name: String(block.name || ''),
+    filePath: typeof block.input.file_path === 'string' ? block.input.file_path : '',
+    oldString,
+    newString,
+    fingerprint: toolCallFingerprint(block.name, block.input),
+  };
+}
+
+function failedEditFingerprints(input) {
+  const toolUses = new Map();
+  const failed = new Set();
+  for (const message of Array.isArray(input?.messages) ? input.messages : []) {
+    const blocks = Array.isArray(message?.content) ? message.content : [];
+    for (const block of blocks) {
+      if (block?.type === 'tool_use' && typeof block.id === 'string') {
+        const info = editToolInfo(block);
+        if (info) toolUses.set(block.id, info);
+        continue;
+      }
+      if (block?.type !== 'tool_result' || block.is_error !== true || typeof block.tool_use_id !== 'string') continue;
+      const info = toolUses.get(block.tool_use_id);
+      if (info) failed.add(info.fingerprint);
+    }
+  }
+  return failed;
+}
+
+function findRejectedEdit(result) {
+  for (const block of Array.isArray(result?.blocks) ? result.blocks : []) {
+    const info = editToolInfo(block);
+    if (info) return info;
+  }
+  return null;
+}
+
+function findLocalReadTool(input) {
+  const tools = toolDefinitions(input);
+  const exact = tools.find((tool) => String(tool.name).toLowerCase() === 'read');
+  if (exact) return exact;
+  return tools.find((tool) => {
+    const corpus = normalizedToolCorpus(tool);
+    const local = /\b(file|filesystem|workspace|local|path)\b/i.test(corpus);
+    const read = /\b(read|view|open file)\b/i.test(corpus);
+    const network = /\b(web|internet|url|http|https|website|webpage)\b/i.test(corpus);
+    return local && read && !network;
+  }) || null;
+}
+
+function latestSuccessfulReadMatches(input, readToolName, filePath) {
+  if (!readToolName || !filePath) return false;
+  const uses = new Map();
+  let latestSuccessfulResult = null;
+  let sequence = 0;
+  for (const message of Array.isArray(input?.messages) ? input.messages : []) {
+    const blocks = Array.isArray(message?.content) ? message.content : [];
+    for (const block of blocks) {
+      sequence += 1;
+      if (block?.type === 'tool_use' && typeof block.id === 'string') {
+        uses.set(block.id, {
+          name: String(block.name || ''),
+          filePath: typeof block.input?.file_path === 'string' ? block.input.file_path : '',
+        });
+        continue;
+      }
+      if (block?.type !== 'tool_result' || block.is_error === true || typeof block.tool_use_id !== 'string') continue;
+      const use = uses.get(block.tool_use_id);
+      if (use) latestSuccessfulResult = { ...use, sequence };
+    }
+  }
+  return latestSuccessfulResult?.name === readToolName && latestSuccessfulResult.filePath === filePath;
+}
+
 function normalizedToolCorpus(tool) {
   let schema = '';
   try {
@@ -352,6 +444,75 @@ function buildGenericRecoveryInstruction(reason) {
   ].join('\n');
 }
 
+function buildEditRepairReadInstruction(reason, rejectedEdit, readTool) {
+  const target = rejectedEdit?.filePath || 'the target file from the rejected edit';
+  const failure = reason === 'no_op_edit_tool_call'
+    ? 'The rejected edit was invalid because old_string and new_string were identical, so it could not change the file.'
+    : 'The same edit already failed and must not be submitted again unchanged.';
+  return [
+    '[RECOVERY CONTROL: EDIT REPAIR]',
+    'This is a recovery generation for the current assistant turn.',
+    'The task state established before the rejected edit remains authoritative.',
+    'Preserve all existing progress. Do not restart, re-plan, re-scope, undo, replace, or repeat completed work.',
+    failure,
+    `Rejected edit tool: ${rejectedEdit?.name || 'unknown'}.`,
+    `Target file: ${target}.`,
+    `Required tool: ${readTool}.`,
+    `Emit exactly one complete ${readTool} Tool Call for ${target}.`,
+    'Do not emit an Edit or Update call in this recovery generation.',
+    'Do not emit analysis, planning, explanation, conclusions, final text, or completion claims.',
+    'After the real file content is returned in the next request, construct a minimal edit whose old_string matches the current file and whose new_string is different.',
+    `Recovery reason: ${reason}.`,
+  ].join('\n');
+}
+
+function buildEditRepairRetryInstruction(reason, rejectedEdit) {
+  const target = rejectedEdit?.filePath || 'the original target file';
+  return [
+    '[RECOVERY CONTROL: EDIT REPAIR]',
+    'This is a recovery generation for the current assistant turn.',
+    'The task state established before the rejected edit remains authoritative.',
+    'Preserve all existing progress. Do not restart, re-plan, re-scope, undo, replace, or repeat completed work.',
+    reason === 'no_op_edit_tool_call'
+      ? 'The rejected edit was invalid because old_string and new_string were identical, so it could not change the file.'
+      : 'The same edit already failed and must not be submitted again unchanged.',
+    `Target file: ${target}.`,
+    `Required tool: ${rejectedEdit?.name || 'the original edit tool'}.`,
+    'Emit exactly one complete corrected edit Tool Call.',
+    'The corrected old_string must match the current file content and new_string must be different from old_string.',
+    'Do not repeat the rejected arguments. Do not emit analysis, explanation, final text, or completion claims.',
+    `Recovery reason: ${reason}.`,
+  ].join('\n');
+}
+
+function buildEditRepairPlan(input, reason, failedResult) {
+  const rejectedEdit = findRejectedEdit(failedResult);
+  const readTool = findLocalReadTool(input);
+  const hasFreshRead = latestSuccessfulReadMatches(input, readTool?.name, rejectedEdit?.filePath);
+  if (readTool && !hasFreshRead) {
+    return {
+      mode: 'edit_repair_read',
+      selectedTool: readTool.name,
+      allowedTools: [readTool.name],
+      instruction: buildEditRepairReadInstruction(reason, rejectedEdit, readTool.name),
+    };
+  }
+
+  const rejectedTool = rejectedEdit?.name
+    ? toolDefinitions(input).find((tool) => tool.name === rejectedEdit.name)
+    : null;
+  if (rejectedTool) {
+    return {
+      mode: 'edit_repair_retry',
+      selectedTool: rejectedTool.name,
+      allowedTools: [rejectedTool.name],
+      instruction: buildEditRepairRetryInstruction(reason, rejectedEdit),
+    };
+  }
+
+  return emptyRecoveryPlan('edit_repair_fallback', buildEditRepairRetryInstruction(reason, rejectedEdit));
+}
+
 function emptyRecoveryPlan(mode, instruction) {
   return {
     mode,
@@ -417,8 +578,12 @@ function candidateRecoveryPlan(stage, input, config, reason) {
   };
 }
 
-export function selectRecoveryPlan(input, config, { kind, reason }) {
+export function selectRecoveryPlan(input, config, { kind, reason, failedResult = null }) {
   const normalizedReason = typeof reason === 'string' && reason ? reason : 'unknown_recovery_reason';
+  if (['no_op_edit_tool_call', 'repeated_failed_edit_tool_call'].includes(normalizedReason)) {
+    return buildEditRepairPlan(input, normalizedReason, failedResult);
+  }
+
   if (kind !== 'loop') {
     return emptyRecoveryPlan('generic_regeneration', buildGenericRecoveryInstruction(normalizedReason));
   }
@@ -524,7 +689,8 @@ export function applyRequestPolicy(input, config, { recoveryReason = null, recov
       : effectiveRecoveryPlan.selectedTool
         ? [effectiveRecoveryPlan.selectedTool]
         : [];
-    const isNetworkRecovery = allowedNetworkTools.length > 0;
+    const isForcedToolRecovery = allowedNetworkTools.length > 0;
+    const isNetworkRecovery = String(effectiveRecoveryPlan.mode || '').startsWith('network_');
     const temperatureMax = isNetworkRecovery
       ? config.recoveryNetworkTemperatureMax
       : config.recoveryTemperatureMax;
@@ -537,7 +703,7 @@ export function applyRequestPolicy(input, config, { recoveryReason = null, recov
     body.max_tokens = Math.min(body.max_tokens, maxTokens);
     body.system = appendSystemInstruction(body.system, effectiveRecoveryPlan.instruction);
 
-    if (isNetworkRecovery) {
+    if (isForcedToolRecovery) {
       const allowed = new Set(allowedNetworkTools);
       body.tools = Array.isArray(body.tools)
         ? body.tools.filter((tool) => allowed.has(tool?.name))
@@ -782,7 +948,7 @@ function invalid(reason, detail) {
   return { ok: false, reason, detail };
 }
 
-export function validateAttempt(result, config) {
+export function validateAttempt(result, config, requestInput = null) {
   if (!result.messageStopped) return invalid('missing_message_stop', 'stream ended before message_stop');
   if (!result.messageStart) return invalid('missing_message_start', 'stream did not contain message_start');
   if (result.errorEvent) return invalid('upstream_sse_error', result.errorEvent?.error?.message || 'upstream error event');
@@ -799,6 +965,7 @@ export function validateAttempt(result, config) {
   let toolCount = 0;
   let hasThinking = false;
   let hasFinalText = false;
+  const previouslyFailedEdits = failedEditFingerprints(requestInput);
   for (const block of result.blocks) {
     if (!block.stopped) return invalid('unclosed_content_block', `content block ${block.upstreamIndex} was not closed`);
     if (block.type === 'thinking' && block.thinking) hasThinking = true;
@@ -819,6 +986,19 @@ export function validateAttempt(result, config) {
       }
       if (!block.input || typeof block.input !== 'object' || Array.isArray(block.input)) {
         return invalid('invalid_tool_input', `tool block ${block.upstreamIndex} input must be an object`);
+      }
+      const editInfo = editToolInfo(block);
+      if (editInfo && editInfo.oldString === editInfo.newString) {
+        return invalid(
+          'no_op_edit_tool_call',
+          `tool block ${block.upstreamIndex} has identical old_string and new_string`,
+        );
+      }
+      if (editInfo && previouslyFailedEdits.has(editInfo.fingerprint)) {
+        return invalid(
+          'repeated_failed_edit_tool_call',
+          `tool block ${block.upstreamIndex} repeats an edit that already failed`,
+        );
       }
     }
   }
@@ -1826,7 +2006,7 @@ async function performStreamingAttempt({ body, request, context, config, timeout
     }
 
     const result = parser.finish();
-    const validation = validateAttempt(result, config);
+    const validation = validateAttempt(result, config, body);
     if (!validation.ok) {
       return { kind: 'invalid', reason: validation.reason, message: validation.detail, result };
     }
@@ -2164,6 +2344,7 @@ export function createProxyServer(config = loadConfig()) {
         const recoveryPlan = selectRecoveryPlan(input, config, {
           kind: first.kind,
           reason: first.reason,
+          failedResult: first.result || null,
         });
         const recoveryBody = applyRequestPolicy(input, config, { recoveryPlan });
         logEvent(config, {
@@ -2210,7 +2391,7 @@ export function createProxyServer(config = loadConfig()) {
         );
       }
 
-      const finalValidation = validateAttempt(finalResult, config);
+      const finalValidation = validateAttempt(finalResult, config, input);
       if (!finalValidation.ok) {
         return await sendSseError(context, 'api_error', `Final response validation failed: ${finalValidation.reason}.`);
       }

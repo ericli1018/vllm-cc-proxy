@@ -20,6 +20,7 @@ Proxy **不做 Anthropic ↔ OpenAI 格式轉換**。只有精確的 `POST /v1/m
 - Thinking block 在 Proxy 內緩衝；同一 Thinking block 發生循環時，保留循環前內容與第一份循環，刪除後續重複，再執行一次 Recovery。
 - 第一輪失敗產生的 text 與 tool calls 不會送到 Claude Code。
 - `tool_use` 的 `partial_json` 必須完整累積並通過 `JSON.parse`，才以一筆完整 `input_json_delta` 輸出。
+- Edit／Update 若 `old_string === new_string`，或完全重送一個已失敗的 Edit，會在送往 Claude Code 前被拒絕並進入 Read-first 修復。
 - 意外截斷時整份第一次 generation 丟棄；最多 Recovery 一次。
 - SSE 已建立後的不可恢復錯誤以 Anthropic `error` event 結束，不偽裝成 Assistant 回覆。
 - 每 Request 與全 process 皆有 buffer 上限，避免數千連線共同造成無界限記憶體成長。
@@ -209,6 +210,31 @@ stop_reason 必須為 tool_use
 
 不符合就以 Anthropic SSE error 結束，錯誤 Tool Call 不會暴露給 Claude Code。搜尋結果、URL 或 Fetch Result只是後續輸入，不代表已驗證結論，也不代表研究或原始任務完成。
 
+### Edit／Update 修復
+
+Proxy 會對具有 `old_string` 與 `new_string` 字串欄位的 Tool Call 做額外語意檢查，不依賴畫面顯示名稱是 `Edit` 或 `Update`：
+
+```text
+old_string === new_string
+→ no_op_edit_tool_call
+
+同一 tool name + canonical input 已在 messages 中以 is_error:true 失敗
+→ repeated_failed_edit_tool_call
+```
+
+這兩種 Tool Call 都不會送到 Claude Code。Recovery 只處理目前的 Edit 阻塞點，不重開既有任務：
+
+```text
+目前 request 有本地 Read 工具，且最新成功 Tool Result 尚未讀取同一 target file
+→ 只保留並強制 Read(target file)
+
+最新成功 Tool Result 已讀取同一 target file
+→ 只保留並強制原 Edit／Update 工具
+→ 要求 old_string 依目前檔案內容重建，且 new_string 必須不同
+```
+
+Recovery Tool Call 仍需通過「恰好一個允許工具、無 Final Text、`stop_reason=tool_use`」硬驗證。若沒有可辨識的本地 Read 工具，Proxy 會直接要求原 Edit 工具產生修正後的非 no-op 參數；第二輪仍無效則以 Anthropic SSE error 結束，不執行錯誤修改。
+
 ### Loop 偵測補強
 
 Loop detector 會正規化大小寫、標點、空白與終端自動換行，並依序檢查 zero-delta correction、行級 A-B-A-B、句子序列重複、長段落 tandem repeat 與 Thinking 長度上限。
@@ -272,6 +298,7 @@ bash scripts/verify.sh
 - heartbeat
 - Thinking Loop 與一次 Recovery
 - fragmented／malformed Tool Call
+- no-op Edit／Update、已失敗 Edit 重送與 Read-first Edit repair
 - upstream truncation／idle timeout
 - client cancellation isolation
 - drain

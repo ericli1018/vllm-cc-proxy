@@ -1064,3 +1064,83 @@ test('transparent forwarding pins absolute-form request targets to the configure
   assert.equal(result.body, '{"ok":true}');
   assert.equal(capturedUrl, '/v1/models?limit=9');
 });
+
+test('rejects a no-op Update before downstream execution and recovers with a forced Read of the target file', async (t) => {
+  let attempts = 0;
+  const captured = [];
+  const targetPath = '/home/master/workspace-claude/src/tls_common.h';
+  const mock = await startMockVllm(async (req, res) => {
+    attempts += 1;
+    captured.push(await readJsonRequest(req));
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+
+    if (attempts === 1) {
+      res.end(messageStart('claude-sonnet-4-6')
+        + toolBlock(0, {
+          id: 'toolu_noop',
+          name: 'Update',
+          chunks: [JSON.stringify({
+            file_path: targetPath,
+            old_string: 'unchanged',
+            new_string: 'unchanged',
+          })],
+        })
+        + endMessage('tool_use'));
+      return;
+    }
+
+    assert.deepEqual(captured[1].tools.map((tool) => tool.name), ['Read']);
+    assert.deepEqual(captured[1].tool_choice, { type: 'tool', name: 'Read' });
+    const system = JSON.stringify(captured[1].system);
+    assert.match(system, /rejected edit/i);
+    assert.match(system, /old_string and new_string were identical/i);
+    assert.match(system, /Preserve all existing progress/i);
+    assert.match(system, new RegExp(targetPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+    res.end(messageStart('claude-sonnet-4-6')
+      + toolBlock(0, {
+        id: 'toolu_read',
+        name: 'Read',
+        chunks: [JSON.stringify({ file_path: targetPath })],
+      })
+      + endMessage('tool_use'));
+  });
+  const proxy = await startProxy(mock.baseUrl);
+  t.after(async () => { await proxy.close(); await mock.close(); });
+
+  const response = await postMessages(proxy.url, {
+    model: 'claude-sonnet-4-6', max_tokens: 8192, stream: true,
+    messages: [{ role: 'user', content: 'Apply the required TLS fix without restarting completed work.' }],
+    tools: [
+      {
+        name: 'Read',
+        description: 'Read a file from the local filesystem.',
+        input_schema: {
+          type: 'object',
+          properties: { file_path: { type: 'string' } },
+          required: ['file_path'],
+        },
+      },
+      {
+        name: 'Update',
+        description: 'Replace an exact string in a local file.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string' },
+            old_string: { type: 'string' },
+            new_string: { type: 'string' },
+          },
+          required: ['file_path', 'old_string', 'new_string'],
+        },
+      },
+    ],
+  });
+  const events = parseSseText(await response.text());
+  const toolStarts = events.filter((event) => event.data.content_block?.type === 'tool_use');
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(toolStarts.map((event) => event.data.content_block.name), ['Read']);
+  assert.equal(events.some((event) => event.data.content_block?.name === 'Update'), false);
+  assert.equal(events.at(-1).event, 'message_stop');
+});

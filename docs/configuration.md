@@ -55,6 +55,16 @@ Generic and network Recovery requests still set their own request-level `tempera
 | `RECOVERY_WEB_SEARCH_TOOL_NAMES` | `WebSearch` | Comma-separated exact built-in／gateway search names. Set empty to remove these exact-name candidates. |
 | `RECOVERY_WEB_FETCH_TOOL_NAMES` | `WebFetch` | Comma-separated exact built-in／gateway fetch names. Set empty to remove these exact-name candidates. |
 
+### Edit repair（無新增環境變數）
+
+Streaming `/v1/messages` 中，只要 Tool Call input 同時包含字串 `old_string` 與 `new_string`，Proxy 就會套用 Edit 語意防護：
+
+- 完全相同的兩個字串視為 `no_op_edit_tool_call`。
+- 與 request history 中 `is_error:true` 的既有 Edit 具有相同 tool name 與 canonical JSON input，視為 `repeated_failed_edit_tool_call`。
+- 有本地 `Read` 工具且最新成功結果尚未讀取 target file 時，Recovery 強制先讀取該檔。
+- 最新成功 Tool Result 已讀取同一 target file 時，Recovery 強制原 Edit／Update 工具產生修正後參數。
+- Edit repair 使用一般 Recovery 上限 `RECOVERY_TEMPERATURE_MAX`／`RECOVERY_MAX_TOKENS`，不使用 network Recovery 的 0.30／1024 上限。
+
 ### Network Tool modes
 
 - `auto`: exact configured MCP names have highest priority. If none match the current request, the Proxy conservatively classifies available `tools[]` from each tool's `name`, `description`, and `input_schema`.

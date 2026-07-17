@@ -47,6 +47,11 @@ The progress-preservation prompt constrains the recovery generation. After the r
 Network recovery rejects non-empty Text output, zero or multiple Tool Calls, names outside the allowed candidate set, and a non-`tool_use` stop reason, but it does not reject valid Thinking blocks. Some reasoning models emit Thinking even when a Tool Call is required; rejecting all Thinking would make recovery brittle. The prompt, 1024-token default cap, Loop detector, and single-recovery limit constrain this behavior but cannot prove the model did not internally reconsider prior hypotheses.
 
 
+
+## Edit semantic validation is deliberately narrow
+
+The Edit guard rejects only exact `old_string === new_string` and exact canonical replay of an Edit-like Tool Call already paired with `is_error:true`. It does not read the filesystem itself, prove that `old_string` exists, validate file encodings, interpret patches, or determine whether a different replacement is logically correct. Read-first recovery depends on a current request tool that can be conservatively recognized as a local file reader. Non-streaming `/v1/messages` responses are forwarded without buffered Tool Call semantic inspection.
+
 ## Loop detection remains heuristic
 
 The detector now covers long tandem cycles, repeated sentence sequences, variable terminal wrapping, and a bounded partial next repeat. It still cannot prove semantic equivalence when the model continuously paraphrases the same idea with different wording. Fenced code and strongly code／log-like candidate ranges are intentionally exempt, so a reasoning loop embedded entirely in a genuine code quotation may not be interrupted. `reasoning_without_action` remains the final safety bound for loops that do not expose enough repeated surface form.

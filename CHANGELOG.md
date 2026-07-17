@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0 - 2026-07-18
+
+- Added schema-based no-op Edit／Update rejection when `old_string` and `new_string` are exactly identical.
+- Added canonical SHA-256 fingerprint detection for exact replay of an Edit-like Tool Call already paired with `is_error:true` in request history.
+- Added Edit-specific Recovery that preserves task state and forces a local Read of the target file before retrying a corrected edit.
+- Prevented Read-only repair loops: if the latest successful Tool Result already read the same target file, Recovery forces the original Edit／Update tool instead.
+- Kept rejected or repeated failed Edit calls fully buffered so Claude Code never executes them.
+- Added unit, policy, and end-to-end tests for meaningful edits, no-op rejection, failed-edit replay, Read-first repair, and corrected-edit retry selection.
+
 ## 0.5.0 - 2026-07-17
 
 - Stopped injecting normal-request defaults for `temperature`, `top_p`, and `top_k`; valid client values are preserved and absent／invalid optional values are omitted for vLLM `--override-generation-config`.
