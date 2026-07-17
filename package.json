@@ -1,0 +1,15 @@
+{
+  "name": "vllm-cc-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "test:config": "node --test tests/config.test.js",
+    "check": "node --check vllm-cc-proxy.js",
+    "test:load": "LOAD_SMOKE_REQUESTS=1000 node --test tests/high-concurrency.test.js"
+  }
+}
