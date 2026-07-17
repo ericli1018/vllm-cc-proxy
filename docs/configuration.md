@@ -38,38 +38,55 @@ Claude thinking.type enabled/disabled
 | Variable | Default | Meaning |
 |---|---:|---|
 | `MAX_RECOVERY_ATTEMPTS` | `1` | Allowed range 0–1. |
-| `RECOVERY_TEMPERATURE_MAX` | `0.45` | Upper bound for non-forced recovery temperature. |
-| `RECOVERY_MAX_TOKENS` | `4096` | Upper bound for non-forced recovery output. |
-| `RECOVERY_NETWORK_TEMPERATURE_MAX` | `0.30` | Upper bound when a loop recovery forces one network Tool Call. |
-| `RECOVERY_NETWORK_MAX_TOKENS` | `1024` | Output cap for the forced network Tool Call recovery turn. |
-| `RECOVERY_MCP_SEARCH_TOOL_PRIORITY` | empty | Comma-separated exact MCP search tool names, highest priority first. |
-| `RECOVERY_MCP_FETCH_TOOL_PRIORITY` | empty | Comma-separated exact MCP source-retrieval tool names, highest priority first. |
-| `RECOVERY_WEB_SEARCH_TOOL_NAMES` | `WebSearch` | Comma-separated exact built-in／gateway search tool names. |
-| `RECOVERY_WEB_FETCH_TOOL_NAMES` | `WebFetch` | Comma-separated exact built-in／gateway fetch tool names. |
+| `RECOVERY_TEMPERATURE_MAX` | `0.45` | Upper bound for generic recovery temperature. |
+| `RECOVERY_MAX_TOKENS` | `4096` | Upper bound for generic recovery output. |
+| `RECOVERY_NETWORK_TEMPERATURE_MAX` | `0.30` | Upper bound for loop recovery that must emit one network Tool Call. |
+| `RECOVERY_NETWORK_MAX_TOKENS` | `1024` | Output cap for the network Tool Call recovery turn. |
+| `RECOVERY_NETWORK_TOOL_MODE` | `auto` | `auto`, `configured-only`, or `disabled`. |
+| `RECOVERY_MCP_SEARCH_TOOL_PRIORITY` | empty | Optional comma-separated exact MCP search names, highest priority first. |
+| `RECOVERY_MCP_FETCH_TOOL_PRIORITY` | empty | Optional comma-separated exact MCP source-retrieval names, highest priority first. |
+| `RECOVERY_WEB_SEARCH_TOOL_NAMES` | `WebSearch` | Comma-separated exact built-in／gateway search names. Set empty to remove these exact-name candidates. |
+| `RECOVERY_WEB_FETCH_TOOL_NAMES` | `WebFetch` | Comma-separated exact built-in／gateway fetch names. Set empty to remove these exact-name candidates. |
 
-### Recovery selection
+### Network Tool modes
+
+- `auto`: exact configured MCP names have highest priority. If none match the current request, the Proxy conservatively classifies available `tools[]` from each tool's `name`, `description`, and `input_schema`.
+- `configured-only`: no heuristic discovery. Only exact configured MCP names and exact `RECOVERY_WEB_*_TOOL_NAMES` are considered.
+- `disabled`: loop recovery does not force any network tool and uses evidence fallback.
 
 Network-first selection is applied only when the first attempt is classified as a Thinking Loop. Transport interruption, malformed SSE, incomplete Tool Call, and other structural failures use generic regeneration and are not redirected to network research.
 
-The Proxy uses exact tool names from the current request. It never invents a missing tool and does not infer arbitrary MCP tools from a substring such as `search` or `fetch`.
+### Automatic classification
+
+`auto` mode uses positive network signals such as web, internet, HTTP(S), URL, webpage, SearXNG, Brave Search, Tavily, fetch, retrieve, browse, and navigate. It rejects tools carrying local-only signals such as local, repository, source code, filesystem, workspace, database, Grep, Glob, and SearchFiles.
+
+This is intentionally conservative. A deployment-specific MCP tool with an opaque name and no useful description is not guessed; add its exact name to the MCP priority variable. The Proxy never adds a tool absent from the current `request.tools[]`.
+
+### Recovery selection
 
 ```text
-completed configured fetch result newer than latest search
+completed successful fetch result newer than latest successful search
 → no forced network call; preserve state and continue from retrieved input
 
-URL-bearing configured search result
-→ configured MCP fetch
-→ configured WebFetch
+URL-bearing successful search result
+→ Fetch stage
 
 otherwise
-→ configured MCP search
-→ configured WebSearch
-→ evidence fallback without a forced network tool
+→ Search stage
 ```
 
-A `tool_result` with `is_error: true` is ignored for state advancement. URL detection is limited to HTTP(S) URLs found in completed configured search Tool Results. A completed fetch result is only treated as retrieved input, not as a verified or authoritative conclusion.
+For either stage:
 
-During a forced network recovery, the Proxy sets Anthropic `tool_choice` to the selected existing tool and appends a short Ornith-specific control prompt. That prompt preserves completed progress, prohibits restart／re-plan／re-scope／undo, and permits only one complete call to the selected tool. It does not create an `Active Outcome` or summarize the original task. The completed recovery is accepted only when it contains exactly one Tool Call with the selected name, no non-empty Text block, and `stop_reason=tool_use`.
+1. If an exact configured MCP priority name is available, the first available name is forced.
+2. In `configured-only`, the first available exact built-in／gateway name is forced.
+3. In `auto`, the Proxy builds stage-matching candidates. If any MCP candidates exist, non-MCP candidates are removed.
+4. One candidate is forced with `tool_choice: {"type":"tool","name":"..."}`.
+5. Multiple candidates replace the Recovery request's `tools[]` with only that set and use `tool_choice: {"type":"any"}` so Ornith chooses one.
+6. No candidate produces evidence fallback without a forced network tool.
+
+A `tool_result` with `is_error: true` does not advance state. Search-to-fetch advancement requires an HTTP(S) URL in a completed Search Tool Result. A completed Fetch Result is evidence input, not a verified or authoritative conclusion.
+
+During network recovery the short Ornith-specific instruction preserves completed progress, prohibits restart／re-plan／re-scope／undo, and permits exactly one complete allowed Tool Call. It does not create an `Active Outcome` or summarize the original task. The completed recovery is accepted only when it contains exactly one Tool Call whose name is in the allowed candidate set, no non-empty Text block, and `stop_reason=tool_use`.
 
 ## Heartbeat and deadlines
 

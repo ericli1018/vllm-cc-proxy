@@ -22,11 +22,16 @@ MAX_RECOVERY_ATTEMPTS=1
 RECOVERY_TEMPERATURE_MAX=0.45
 RECOVERY_MAX_TOKENS=4096
 
-# Ornith loop recovery: exact tool names only. Configured MCP tools have priority.
+# Ornith loop recovery. Default auto mode discovers network tools from current tools[].
 RECOVERY_NETWORK_TEMPERATURE_MAX=0.30
 RECOVERY_NETWORK_MAX_TOKENS=1024
-RECOVERY_MCP_SEARCH_TOOL_PRIORITY=mcp__searxng__search,mcp__brave-search__brave_web_search
-RECOVERY_MCP_FETCH_TOOL_PRIORITY=mcp__fetch__fetch
+RECOVERY_NETWORK_TOOL_MODE=auto
+
+# Optional exact MCP overrides. First available configured name is forced.
+RECOVERY_MCP_SEARCH_TOOL_PRIORITY=
+RECOVERY_MCP_FETCH_TOOL_PRIORITY=
+
+# Exact built-in／gateway names. Empty values disable those exact-name fallbacks.
 RECOVERY_WEB_SEARCH_TOOL_NAMES=WebSearch
 RECOVERY_WEB_FETCH_TOOL_NAMES=WebFetch
 

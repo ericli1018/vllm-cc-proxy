@@ -120,7 +120,7 @@ seed
 
 ### Thinking Loop：Ornith 網路證據 Recovery
 
-只有第一輪被分類為 Thinking Loop 時，Proxy 才啟用網路優先狀態機。Proxy 不先詢問模型是否需要研究，而是直接檢查原始 request 的 `tools[]` 與既有 `tool_use`／`tool_result`。
+只有第一輪被分類為 Thinking Loop 時，Proxy 才啟用網路優先狀態機。Proxy 不先詢問模型是否需要研究，而是檢查原始 request 的 `tools[]` 與既有 `tool_use`／`tool_result`。
 
 ```text
 已有較新的成功 Fetch Result
@@ -128,36 +128,77 @@ seed
 → 只加入保留進度的 evidence-available prompt
 
 已有帶 HTTP(S) URL 的成功 Search Result
-→ MCP Fetch（明確設定的 exact name）
-→ WebFetch
+→ 建立 Fetch 候選集合
 
 尚未有可讀取 URL
-→ MCP Search（明確設定的 exact name）
-→ WebSearch
-
-沒有任何核准的網路工具
-→ 不虛構工具，回退到一般 evidence-producing action
+→ 建立 Search 候選集合
 ```
 
-MCP 優先清單由環境變數明確指定：
+預設模式：
+
+```bash
+RECOVERY_NETWORK_TOOL_MODE=auto
+```
+
+可用模式：
+
+| 模式 | 行為 |
+|---|---|
+| `auto` | 明確 MCP 設定優先；沒有命中時，依 `tools[].name`、`description` 與 `input_schema` 自動辨識網路 Search／Fetch 工具。 |
+| `configured-only` | 只使用明確設定的 MCP 名稱及 `RECOVERY_WEB_*_TOOL_NAMES`。 |
+| `disabled` | 關閉網路 Recovery，回退到一般 evidence-producing action。 |
+
+明確 MCP 設定仍具有最高優先權：
 
 ```bash
 RECOVERY_MCP_SEARCH_TOOL_PRIORITY='mcp__searxng__search,mcp__brave-search__brave_web_search'
 RECOVERY_MCP_FETCH_TOOL_PRIORITY='mcp__fetch__fetch'
 ```
 
-Proxy 只會選擇同時存在於目前 `request.tools[]` 的 exact tool name。`tool_result.is_error=true` 不會被當成研究進度。
+若第一個可用的明確 MCP 名稱存在，Proxy 直接強制該工具。若沒有命中明確設定，`auto` 模式會建立階段相符的候選集合：
 
-選到工具後，Recovery request 會：
+```text
+Search 階段：MCP Search 候選 > WebSearch／其他非 MCP Search 候選
+Fetch 階段：MCP Fetch 候選 > WebFetch／其他非 MCP Fetch 候選
+```
+
+自動辨識是保守的機械式判斷：
+
+- 使用工具名稱、描述與輸入 schema 的網路語意，例如 web、internet、URL、SearXNG、Brave、Tavily、fetch、navigate。
+- 明確排除 local、repository、source code、filesystem、database、Grep、Glob、SearchFiles 等本地語意。
+- 名稱不透明且沒有足夠描述的 MCP 工具不會被猜測；可用 exact priority 明確加入。
+
+候選處理：
+
+```text
+只有一個候選
+→ 只保留該工具
+→ tool_choice: {"type":"tool","name":"..."}
+
+有多個候選
+→ Recovery request 的 tools[] 只保留候選集合
+→ tool_choice: {"type":"any"}
+→ 由 Ornith 在受限候選集合中選擇一個
+```
+
+Recovery request 同時會：
 
 - 保留 Claude Code 傳入的 model 原值。
 - 使用較緊的 `temperature <= 0.30` 與 `max_tokens <= 1024`。
-- 設定 `tool_choice: {"type":"tool","name":"..."}`。
 - 附加 Ornith 專用短 prompt：既有任務狀態與完成進度仍具權威，不得重新開始、重新規劃、重新劃定範圍、撤銷或替換已完成工作。
-- 禁止解釋文字、結論、Final Response、完成宣告與其他 Tool Call；可執行輸出只能是一個完整的指定網路 Tool Call。Proxy 會在上游完成後再次驗證工具數量、名稱、non-empty Text block 與 `stop_reason`，不符合就以 SSE error 結束。Ornith 協議仍可能產生受 buffer 與 1024-token 上限約束的 Thinking block。
+- 禁止分析文字、結論、Final Response 與完成宣告；可執行輸出只能是一個完整的允許網路 Tool Call。
 - 不建立 `Active Outcome`，也不重新摘要原始任務。
 
-搜尋結果、URL 或 Fetch Result只是後續輸入，不代表已驗證結論，也不代表研究或原始任務完成。
+Proxy 在 Recovery 完成後再次硬驗證：
+
+```text
+Tool Call 數量必須正好為 1
+Tool name 必須位於候選集合
+不得有 non-empty Text block
+stop_reason 必須為 tool_use
+```
+
+不符合就以 Anthropic SSE error 結束，錯誤 Tool Call 不會暴露給 Claude Code。搜尋結果、URL 或 Fetch Result只是後續輸入，不代表已驗證結論，也不代表研究或原始任務完成。
 
 ### Loop 內容保留
 

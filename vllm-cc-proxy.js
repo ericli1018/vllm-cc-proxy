@@ -45,8 +45,13 @@ function trimTrailingSlash(value) {
   return String(value).replace(/\/+$/, '');
 }
 
+function parseEnum(value, allowed, fallback) {
+  const normalized = String(value ?? fallback).trim().toLowerCase();
+  return allowed.includes(normalized) ? normalized : fallback;
+}
+
 function parseNameList(value, defaults = []) {
-  const source = value === undefined || value === null || value === ''
+  const source = value === undefined || value === null
     ? defaults
     : String(value).split(',');
   const seen = new Set();
@@ -78,6 +83,11 @@ export function loadConfig(env = process.env) {
     recoveryMaxTokens: parseInteger(env.RECOVERY_MAX_TOKENS, 4096, { min: 1 }),
     recoveryNetworkTemperatureMax: parseNumber(env.RECOVERY_NETWORK_TEMPERATURE_MAX, 0.30, { min: 0, max: 2 }),
     recoveryNetworkMaxTokens: parseInteger(env.RECOVERY_NETWORK_MAX_TOKENS, 1024, { min: 1 }),
+    recoveryNetworkToolMode: parseEnum(
+      env.RECOVERY_NETWORK_TOOL_MODE,
+      ['auto', 'configured-only', 'disabled'],
+      'auto',
+    ),
     recoveryMcpSearchToolPriority: Object.freeze(parseNameList(env.RECOVERY_MCP_SEARCH_TOOL_PRIORITY)),
     recoveryMcpFetchToolPriority: Object.freeze(parseNameList(env.RECOVERY_MCP_FETCH_TOOL_PRIORITY)),
     recoveryWebSearchToolNames: Object.freeze(parseNameList(env.RECOVERY_WEB_SEARCH_TOOL_NAMES, ['WebSearch'])),
@@ -156,15 +166,76 @@ function firstAvailable(priority, available) {
   return priority.find((name) => available.has(name)) || null;
 }
 
-function inspectNetworkToolHistory(input, config) {
-  const searchNames = new Set([
+function toolDefinitions(input) {
+  return (Array.isArray(input?.tools) ? input.tools : [])
+    .filter((tool) => tool && typeof tool === 'object' && typeof tool.name === 'string' && tool.name);
+}
+
+function normalizedToolCorpus(tool) {
+  let schema = '';
+  try {
+    schema = JSON.stringify(tool?.input_schema || {});
+  } catch {
+    schema = '';
+  }
+  return `${tool?.name || ''} ${tool?.description || ''} ${schema}`
+    .toLowerCase()
+    .replace(/[_./:-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isMcpToolName(name) {
+  return /^mcp__/i.test(String(name || ''));
+}
+
+function classifyNetworkTool(tool, config) {
+  const name = String(tool?.name || '');
+  const exactSearch = new Set([
     ...config.recoveryMcpSearchToolPriority,
     ...config.recoveryWebSearchToolNames,
   ]);
-  const fetchNames = new Set([
+  const exactFetch = new Set([
     ...config.recoveryMcpFetchToolPriority,
     ...config.recoveryWebFetchToolNames,
   ]);
+  let search = exactSearch.has(name);
+  let fetch = exactFetch.has(name);
+
+  if (config.recoveryNetworkToolMode !== 'auto') {
+    return { search, fetch, isMcp: isMcpToolName(name) };
+  }
+
+  const corpus = normalizedToolCorpus(tool);
+  const localOnly = /\b(local|localhost|repository|repo|codebase|source code|filesystem|file system|workspace|directory|database|grep|glob|search files|project files)\b/i.test(corpus);
+  if (!localOnly) {
+    const knownSearchProvider = /\b(searxng|searx|brave search|tavily|serper|serpapi|duckduckgo|ddg|exa search|bing search|google search|perplexity)\b/i.test(corpus);
+    const knownFetchProvider = /\b(playwright|puppeteer|browser navigate|browser open|web fetch|url fetch|http get)\b/i.test(corpus);
+    const networkContext = /\b(web|internet|online|external|public web|current information|website|webpage|http|https|url)\b/i.test(corpus);
+    const searchAction = /\b(search|research|query|discover|find)\b/i.test(corpus);
+    const fetchAction = /\b(fetch|retrieve|open|browse|navigate|download|crawl|scrape|read)\b/i.test(corpus);
+    const schemaHasUrl = /\b(url|uri|href|link)\b/i.test(corpus);
+
+    search ||= knownSearchProvider || (networkContext && searchAction);
+    fetch ||= knownFetchProvider || ((networkContext || schemaHasUrl) && fetchAction);
+  }
+
+  return { search, fetch, isMcp: isMcpToolName(name) };
+}
+
+function networkToolIndex(input, config) {
+  const index = new Map();
+  for (const tool of toolDefinitions(input)) {
+    index.set(tool.name, {
+      tool,
+      ...classifyNetworkTool(tool, config),
+    });
+  }
+  return index;
+}
+
+function inspectNetworkToolHistory(input, config) {
+  const index = networkToolIndex(input, config);
   const toolUses = new Map();
   const results = [];
   let sequence = 0;
@@ -174,17 +245,25 @@ function inspectNetworkToolHistory(input, config) {
     for (const block of blocks) {
       sequence += 1;
       if (block?.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
-        toolUses.set(block.id, { name: block.name, sequence });
+        toolUses.set(block.id, { name: block.name, input: block.input, sequence });
         continue;
       }
       if (block?.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
       if (block.is_error === true) continue;
       const use = toolUses.get(block.tool_use_id);
-      if (!use) continue;
+      const classification = use ? index.get(use.name) : null;
+      if (!use || !classification || (!classification.search && !classification.fetch)) continue;
+
       let kind = null;
-      if (searchNames.has(use.name)) kind = 'search';
-      if (fetchNames.has(use.name)) kind = 'fetch';
-      if (!kind) continue;
+      if (classification.search && classification.fetch) {
+        const inputText = contentToText(use.input);
+        kind = /https?:\/\//i.test(inputText) ? 'fetch' : 'search';
+      } else if (classification.fetch) {
+        kind = 'fetch';
+      } else {
+        kind = 'search';
+      }
+
       const text = contentToText(block.content);
       results.push({
         kind,
@@ -212,6 +291,23 @@ function buildForcedNetworkInstruction(reason, selectedTool) {
     `Required tool: ${selectedTool}.`,
     `Emit exactly one complete call to ${selectedTool} to obtain missing current external evidence for that blocker.`,
     'Do not emit analysis, planning, explanation, conclusions, final text, completion claims, or any other tool call.',
+    'Do not change existing task state before the real tool result is returned.',
+  ].join('\n');
+}
+
+function buildChoiceNetworkInstruction(reason, allowedTools) {
+  return [
+    '[RECOVERY CONTROL]',
+    'This is a recovery generation for the current assistant turn.',
+    'The task state established before the failed generation remains authoritative.',
+    'Preserve all existing progress.',
+    'Do not restart, re-plan, re-scope, undo, replace, or reconsider completed work.',
+    'Only the unresolved blocker that caused the reasoning loop is open.',
+    `Recovery reason: ${reason}.`,
+    `Allowed network tools: ${allowedTools.join(', ')}.`,
+    'Choose exactly one allowed network tool that can obtain the missing current external evidence for that blocker.',
+    'Emit exactly one complete Tool Call. Do not call any tool outside the allowed set.',
+    'Do not emit analysis, planning, explanation, conclusions, final text, or completion claims.',
     'Do not change existing task state before the real tool result is returned.',
   ].join('\n');
 }
@@ -259,74 +355,122 @@ function buildGenericRecoveryInstruction(reason) {
   ].join('\n');
 }
 
-export function selectRecoveryPlan(input, config, { kind, reason }) {
-  const normalizedReason = typeof reason === 'string' && reason ? reason : 'unknown_recovery_reason';
-  if (kind !== 'loop') {
-    return {
-      mode: 'generic_regeneration',
-      selectedTool: null,
-      instruction: buildGenericRecoveryInstruction(normalizedReason),
-    };
-  }
-
-  const available = new Set(
-    (Array.isArray(input?.tools) ? input.tools : [])
-      .map((tool) => tool?.name)
-      .filter((name) => typeof name === 'string' && name),
-  );
-  const { latestSearch, latestFetch } = inspectNetworkToolHistory(input, config);
-
-  if (latestFetch && (!latestSearch || latestFetch.sequence > latestSearch.sequence)) {
-    return {
-      mode: 'evidence_available',
-      selectedTool: null,
-      instruction: buildEvidenceAvailableInstruction(normalizedReason),
-    };
-  }
-
-  if (latestSearch?.hasUrl) {
-    const selectedFetch = firstAvailable(config.recoveryMcpFetchToolPriority, available)
-      || firstAvailable(config.recoveryWebFetchToolNames, available);
-    if (selectedFetch) {
-      return {
-        mode: 'network_fetch',
-        selectedTool: selectedFetch,
-        instruction: buildForcedNetworkInstruction(normalizedReason, selectedFetch),
-      };
-    }
-  }
-
-  const selectedSearch = firstAvailable(config.recoveryMcpSearchToolPriority, available)
-    || firstAvailable(config.recoveryWebSearchToolNames, available);
-  if (selectedSearch) {
-    return {
-      mode: 'network_search',
-      selectedTool: selectedSearch,
-      instruction: buildForcedNetworkInstruction(normalizedReason, selectedSearch),
-    };
-  }
-
+function emptyRecoveryPlan(mode, instruction) {
   return {
-    mode: 'evidence_fallback',
+    mode,
     selectedTool: null,
-    instruction: buildEvidenceFallbackInstruction(normalizedReason),
+    allowedTools: [],
+    instruction,
   };
 }
 
+function candidateRecoveryPlan(stage, input, config, reason) {
+  const tools = toolDefinitions(input);
+  const available = new Set(tools.map((tool) => tool.name));
+  const configuredMcp = stage === 'fetch'
+    ? config.recoveryMcpFetchToolPriority
+    : config.recoveryMcpSearchToolPriority;
+  const configuredWeb = stage === 'fetch'
+    ? config.recoveryWebFetchToolNames
+    : config.recoveryWebSearchToolNames;
+
+  const selectedConfiguredMcp = firstAvailable(configuredMcp, available);
+  if (selectedConfiguredMcp) {
+    return {
+      mode: `network_${stage}`,
+      selectedTool: selectedConfiguredMcp,
+      allowedTools: [selectedConfiguredMcp],
+      instruction: buildForcedNetworkInstruction(reason, selectedConfiguredMcp),
+    };
+  }
+
+  if (config.recoveryNetworkToolMode === 'disabled') return null;
+
+  if (config.recoveryNetworkToolMode === 'configured-only') {
+    const selectedConfiguredWeb = firstAvailable(configuredWeb, available);
+    if (!selectedConfiguredWeb) return null;
+    return {
+      mode: `network_${stage}`,
+      selectedTool: selectedConfiguredWeb,
+      allowedTools: [selectedConfiguredWeb],
+      instruction: buildForcedNetworkInstruction(reason, selectedConfiguredWeb),
+    };
+  }
+
+  const index = networkToolIndex(input, config);
+  const discovered = tools
+    .filter((tool) => index.get(tool.name)?.[stage])
+    .map((tool) => tool.name);
+  const mcpCandidates = discovered.filter(isMcpToolName);
+  const allowedTools = mcpCandidates.length > 0 ? mcpCandidates : discovered;
+  if (allowedTools.length === 0) return null;
+  if (allowedTools.length === 1) {
+    return {
+      mode: `network_${stage}`,
+      selectedTool: allowedTools[0],
+      allowedTools,
+      instruction: buildForcedNetworkInstruction(reason, allowedTools[0]),
+    };
+  }
+  return {
+    mode: `network_${stage}_choice`,
+    selectedTool: null,
+    allowedTools,
+    instruction: buildChoiceNetworkInstruction(reason, allowedTools),
+  };
+}
+
+export function selectRecoveryPlan(input, config, { kind, reason }) {
+  const normalizedReason = typeof reason === 'string' && reason ? reason : 'unknown_recovery_reason';
+  if (kind !== 'loop') {
+    return emptyRecoveryPlan('generic_regeneration', buildGenericRecoveryInstruction(normalizedReason));
+  }
+
+  if (config.recoveryNetworkToolMode === 'disabled') {
+    return emptyRecoveryPlan('evidence_fallback', buildEvidenceFallbackInstruction(normalizedReason));
+  }
+
+  const { latestSearch, latestFetch } = inspectNetworkToolHistory(input, config);
+
+  if (latestFetch && (!latestSearch || latestFetch.sequence > latestSearch.sequence)) {
+    return emptyRecoveryPlan('evidence_available', buildEvidenceAvailableInstruction(normalizedReason));
+  }
+
+  if (latestSearch?.hasUrl) {
+    const fetchPlan = candidateRecoveryPlan('fetch', input, config, normalizedReason);
+    if (fetchPlan) return fetchPlan;
+  }
+
+  const searchPlan = candidateRecoveryPlan('search', input, config, normalizedReason);
+  if (searchPlan) return searchPlan;
+
+  return emptyRecoveryPlan('evidence_fallback', buildEvidenceFallbackInstruction(normalizedReason));
+}
+
 function validateRecoveryContract(result, recoveryPlan) {
-  if (!recoveryPlan?.selectedTool) return { ok: true };
+  const allowedTools = Array.isArray(recoveryPlan?.allowedTools) && recoveryPlan.allowedTools.length > 0
+    ? recoveryPlan.allowedTools
+    : recoveryPlan?.selectedTool
+      ? [recoveryPlan.selectedTool]
+      : [];
+  if (allowedTools.length === 0) return { ok: true };
+
+  const allowed = new Set(allowedTools);
   const blocks = Array.isArray(result?.blocks) ? result.blocks : [];
   const toolBlocks = blocks.filter((block) => block.type === 'tool_use');
   if (toolBlocks.length !== 1) {
-    return { ok: false, reason: 'forced_network_tool_count_mismatch' };
+    return { ok: false, reason: 'network_recovery_tool_count_mismatch' };
   }
-  if (toolBlocks[0].name !== recoveryPlan.selectedTool) {
+  if (!allowed.has(toolBlocks[0].name)) {
+    return { ok: false, reason: 'network_recovery_tool_not_allowed' };
+  }
+  if (recoveryPlan?.selectedTool && toolBlocks[0].name !== recoveryPlan.selectedTool) {
     return { ok: false, reason: 'forced_network_tool_name_mismatch' };
   }
   const hasText = blocks.some((block) => block.type === 'text' && String(block.text || '').trim());
-  if (hasText) return { ok: false, reason: 'forced_network_recovery_emitted_text' };
+  if (hasText) return { ok: false, reason: 'network_recovery_emitted_text' };
   if (result.stopReason !== 'tool_use') {
-    return { ok: false, reason: 'forced_network_recovery_stop_reason_mismatch' };
+    return { ok: false, reason: 'network_recovery_stop_reason_mismatch' };
   }
   return { ok: true };
 }
@@ -358,6 +502,7 @@ export function applyRequestPolicy(input, config, { recoveryReason = null, recov
     ? {
       mode: 'generic_regeneration',
       selectedTool: null,
+      allowedTools: [],
       instruction: [
         'The previous generation entered a repetitive reasoning cycle or produced an incomplete response.',
         buildGenericRecoveryInstruction(recoveryReason),
@@ -366,20 +511,33 @@ export function applyRequestPolicy(input, config, { recoveryReason = null, recov
     : null);
 
   if (effectiveRecoveryPlan) {
-    const forcedNetworkTool = effectiveRecoveryPlan.selectedTool;
-    const temperatureMax = forcedNetworkTool
+    const allowedNetworkTools = Array.isArray(effectiveRecoveryPlan.allowedTools)
+      && effectiveRecoveryPlan.allowedTools.length > 0
+      ? effectiveRecoveryPlan.allowedTools
+      : effectiveRecoveryPlan.selectedTool
+        ? [effectiveRecoveryPlan.selectedTool]
+        : [];
+    const isNetworkRecovery = allowedNetworkTools.length > 0;
+    const temperatureMax = isNetworkRecovery
       ? config.recoveryNetworkTemperatureMax
       : config.recoveryTemperatureMax;
-    const maxTokens = forcedNetworkTool
+    const maxTokens = isNetworkRecovery
       ? config.recoveryNetworkMaxTokens
       : config.recoveryMaxTokens;
     body.temperature = Math.min(Number(body.temperature), temperatureMax);
     body.max_tokens = Math.min(Number(body.max_tokens), maxTokens);
     body.system = appendSystemInstruction(body.system, effectiveRecoveryPlan.instruction);
-    if (forcedNetworkTool) {
-      const toolExists = Array.isArray(body.tools)
-        && body.tools.some((tool) => tool?.name === forcedNetworkTool);
-      if (toolExists) body.tool_choice = { type: 'tool', name: forcedNetworkTool };
+
+    if (isNetworkRecovery) {
+      const allowed = new Set(allowedNetworkTools);
+      body.tools = Array.isArray(body.tools)
+        ? body.tools.filter((tool) => allowed.has(tool?.name))
+        : [];
+      if (effectiveRecoveryPlan.selectedTool) {
+        body.tool_choice = { type: 'tool', name: effectiveRecoveryPlan.selectedTool };
+      } else {
+        body.tool_choice = { type: 'any' };
+      }
     }
   }
 
@@ -1886,6 +2044,7 @@ export function createProxyServer(config = loadConfig()) {
           request_id: requestId,
           recovery_mode: recoveryPlan.mode,
           selected_tool: recoveryPlan.selectedTool,
+          allowed_tools: recoveryPlan.allowedTools,
           reason: first.reason,
         });
         const recovery = await performStreamingAttempt({

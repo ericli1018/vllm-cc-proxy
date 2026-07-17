@@ -34,15 +34,17 @@ DFlash speculative decoding, reasoning parser, tool-call parser, chat template, 
 
 ## Network recovery classification is mechanical
 
-The proxy does not decide whether a source is truly official, authoritative, relevant, or sufficient. It only recognizes exact configured Search／Fetch tool names, successful matching Tool Results, their order, and HTTP(S) URL presence. A completed Fetch Tool Result is passed to the next model turn as evidence input, not certified truth.
+The proxy does not decide whether a source is truly official, authoritative, relevant, or sufficient. It recognizes successful matching Tool Results, their order, HTTP(S) URL presence, exact configured names, and—only in `auto` mode—conservative network semantics in each tool's name, description, and input schema. A completed Fetch Tool Result is evidence input, not certified truth.
 
-MCP tool names are deployment-specific and must be configured exactly. If Claude Code omits the tool from `tools[]`, permission policy denies it, vLLM cannot force it, or the model emits invalid arguments, the proxy cannot bypass those failures.
+Automatic discovery can produce false negatives or false positives. Opaque MCP names with no useful description are intentionally ignored. A tool whose description mixes web access with local repository or database operations may also be excluded by the conservative local-only filter. Use exact MCP priority variables when deterministic classification is required, `configured-only` to disable heuristics, or `disabled` to disable network recovery.
+
+If Claude Code omits a tool from `tools[]`, permission policy denies it, vLLM cannot honor `tool_choice`, or the model emits invalid arguments, the proxy cannot bypass those failures. Multiple auto-discovered candidates are filtered into the Recovery request and left to Ornith through `tool_choice:any`; this does not guarantee that the semantically best candidate is chosen.
 
 The URL detector intentionally does not parse arbitrary user prose, relative links, browser state, or vendor-specific nested result schemas beyond their serialized text. A relevant URL supplied directly by the user may therefore not trigger fetch-first recovery.
 
 The progress-preservation prompt constrains the recovery generation. After the real Tool Result returns in a later Claude Code request, normal model behavior resumes; the proxy cannot guarantee that the model will never reconsider prior work. Existing runtime policies and tests should still enforce decision preservation and evidence-gated changes.
 
-Forced network recovery rejects non-empty Text output and any Tool Call count／name mismatch, but it does not reject valid Thinking blocks. Some reasoning models emit Thinking even when `tool_choice` is forced; rejecting all Thinking would make recovery brittle. The prompt, 1024-token default cap, Loop detector, and single-recovery limit constrain this behavior but cannot prove the model did not internally reconsider prior hypotheses.
+Network recovery rejects non-empty Text output, zero or multiple Tool Calls, names outside the allowed candidate set, and a non-`tool_use` stop reason, but it does not reject valid Thinking blocks. Some reasoning models emit Thinking even when a Tool Call is required; rejecting all Thinking would make recovery brittle. The prompt, 1024-token default cap, Loop detector, and single-recovery limit constrain this behavior but cannot prove the model did not internally reconsider prior hypotheses.
 
 ## Global buffer accounting
 

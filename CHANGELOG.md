@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 - 2026-07-17
+
+- Added `RECOVERY_NETWORK_TOOL_MODE` with `auto`, `configured-only`, and `disabled` modes; `auto` is the default.
+- Added conservative network Tool discovery from `tools[].name`, `description`, and `input_schema`, with explicit local／repository／database exclusions.
+- Preserved explicit MCP priority overrides; when none match, automatically builds stage-specific Search or Fetch candidates.
+- Gives MCP candidates priority over WebSearch／WebFetch candidates during automatic selection.
+- When one candidate exists, forces it; when multiple candidates exist, filters the Recovery request to that candidate set and uses `tool_choice: any` so Ornith chooses exactly one.
+- Added post-generation validation that rejects zero, multiple, text-bearing, or out-of-candidate Recovery Tool Calls.
+- Added unit and end-to-end tests for auto-discovery, MCP-only candidate restriction, configured-only／disabled modes, and out-of-set rejection.
+
 ## 0.3.0 - 2026-07-17
 
 - Added Ornith-specific, progress-preserving Recovery control for Thinking Loops.

@@ -191,6 +191,7 @@ test('loadConfig parses exact MCP-first recovery tool priorities and network sam
     RECOVERY_WEB_FETCH_TOOL_NAMES: 'WebFetch,CustomWebFetch',
     RECOVERY_NETWORK_TEMPERATURE_MAX: '0.25',
     RECOVERY_NETWORK_MAX_TOKENS: '768',
+    RECOVERY_NETWORK_TOOL_MODE: 'configured-only',
   });
 
   assert.deepEqual(config.recoveryMcpSearchToolPriority, [
@@ -202,6 +203,205 @@ test('loadConfig parses exact MCP-first recovery tool priorities and network sam
   assert.deepEqual(config.recoveryWebFetchToolNames, ['WebFetch', 'CustomWebFetch']);
   assert.equal(config.recoveryNetworkTemperatureMax, 0.25);
   assert.equal(config.recoveryNetworkMaxTokens, 768);
+  assert.equal(config.recoveryNetworkToolMode, 'configured-only');
+});
+
+
+
+test('loadConfig defaults network recovery tool mode to auto and rejects unknown values', () => {
+  assert.equal(loadConfig({}).recoveryNetworkToolMode, 'auto');
+  assert.equal(loadConfig({ RECOVERY_NETWORK_TOOL_MODE: 'disabled' }).recoveryNetworkToolMode, 'disabled');
+  assert.equal(loadConfig({ RECOVERY_NETWORK_TOOL_MODE: 'unsupported' }).recoveryNetworkToolMode, 'auto');
+});
+
+test('selectRecoveryPlan auto-discovers MCP search tools and lets Ornith choose within the MCP-only candidate set', () => {
+  const config = loadConfig({ RECOVERY_NETWORK_TOOL_MODE: 'auto' });
+  const input = {
+    messages: [{ role: 'user', content: 'check current behavior' }],
+    tools: [
+      {
+        name: 'mcp__searxng__search',
+        description: 'Search the public web with SearXNG for current information.',
+        input_schema: { type: 'object', properties: { query: { type: 'string' } } },
+      },
+      {
+        name: 'mcp__tavily__research',
+        description: 'Research current information on the internet.',
+        input_schema: { type: 'object', properties: { query: { type: 'string' } } },
+      },
+      { name: 'WebSearch', description: 'Search the web.', input_schema: { type: 'object' } },
+      { name: 'SearchFiles', description: 'Search local repository files.', input_schema: { type: 'object' } },
+      { name: 'Read', description: 'Read a local file.', input_schema: { type: 'object' } },
+    ],
+  };
+
+  const plan = selectRecoveryPlan(input, config, { kind: 'loop', reason: 'abab_reasoning_loop' });
+
+  assert.equal(plan.mode, 'network_search_choice');
+  assert.equal(plan.selectedTool, null);
+  assert.deepEqual(plan.allowedTools, ['mcp__searxng__search', 'mcp__tavily__research']);
+  assert.match(plan.instruction, /Choose exactly one allowed network tool/i);
+  assert.match(plan.instruction, /mcp__searxng__search/);
+  assert.doesNotMatch(plan.instruction, /SearchFiles/);
+});
+
+test('selectRecoveryPlan auto-discovers one opaque-by-provider MCP search and forces it', () => {
+  const config = loadConfig({ RECOVERY_NETWORK_TOOL_MODE: 'auto' });
+  const input = {
+    messages: [],
+    tools: [
+      {
+        name: 'mcp__brave-search__brave_web_search',
+        input_schema: { type: 'object', properties: { query: { type: 'string' } } },
+      },
+      { name: 'Read', description: 'Read a local file.', input_schema: { type: 'object' } },
+    ],
+  };
+
+  const plan = selectRecoveryPlan(input, config, { kind: 'loop', reason: 'reasoning_without_action' });
+
+  assert.equal(plan.mode, 'network_search');
+  assert.equal(plan.selectedTool, 'mcp__brave-search__brave_web_search');
+  assert.deepEqual(plan.allowedTools, ['mcp__brave-search__brave_web_search']);
+});
+
+test('selectRecoveryPlan auto-discovers MCP fetch candidates after a URL-bearing search result and excludes WebFetch', () => {
+  const config = loadConfig({ RECOVERY_NETWORK_TOOL_MODE: 'auto' });
+  const input = {
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_search', name: 'WebSearch', input: { query: 'vllm' } }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_search', content: 'https://docs.vllm.ai/' }],
+      },
+    ],
+    tools: [
+      { name: 'WebSearch', description: 'Search the web.', input_schema: { type: 'object' } },
+      { name: 'WebFetch', description: 'Fetch a webpage by URL.', input_schema: { type: 'object', properties: { url: { type: 'string' } } } },
+      {
+        name: 'mcp__fetch__fetch',
+        description: 'Retrieve a webpage from an HTTP URL.',
+        input_schema: { type: 'object', properties: { url: { type: 'string' } } },
+      },
+      {
+        name: 'mcp__playwright__browser_navigate',
+        description: 'Navigate a browser to a URL and return page content.',
+        input_schema: { type: 'object', properties: { url: { type: 'string' } } },
+      },
+    ],
+  };
+
+  const plan = selectRecoveryPlan(input, config, { kind: 'loop', reason: 'semantic_stall_timeout' });
+
+  assert.equal(plan.mode, 'network_fetch_choice');
+  assert.equal(plan.selectedTool, null);
+  assert.deepEqual(plan.allowedTools, [
+    'mcp__fetch__fetch',
+    'mcp__playwright__browser_navigate',
+  ]);
+});
+
+test('selectRecoveryPlan does not auto-classify opaque or local search tools as network tools', () => {
+  const config = loadConfig({ RECOVERY_NETWORK_TOOL_MODE: 'auto' });
+  const input = {
+    messages: [],
+    tools: [
+      { name: 'mcp__custom__run', input_schema: { type: 'object' } },
+      { name: 'mcp__repo__search', description: 'Search source code in the local repository.', input_schema: { type: 'object' } },
+      { name: 'DatabaseSearch', description: 'Query the local database.', input_schema: { type: 'object' } },
+    ],
+  };
+
+  const plan = selectRecoveryPlan(input, config, { kind: 'loop', reason: 'semantic_stall_timeout' });
+
+  assert.equal(plan.mode, 'evidence_fallback');
+  assert.equal(plan.selectedTool, null);
+  assert.deepEqual(plan.allowedTools, []);
+});
+
+test('selectRecoveryPlan configured MCP priority overrides auto-discovered alternatives', () => {
+  const config = loadConfig({
+    RECOVERY_NETWORK_TOOL_MODE: 'auto',
+    RECOVERY_MCP_SEARCH_TOOL_PRIORITY: 'mcp__preferred__search,mcp__other__search',
+  });
+  const input = {
+    messages: [],
+    tools: [
+      { name: 'mcp__other__search', description: 'Search the internet.', input_schema: { type: 'object' } },
+      { name: 'mcp__preferred__search', description: 'Search the internet.', input_schema: { type: 'object' } },
+      { name: 'mcp__tavily__search', description: 'Search the web.', input_schema: { type: 'object' } },
+    ],
+  };
+
+  const plan = selectRecoveryPlan(input, config, { kind: 'loop', reason: 'abab_reasoning_loop' });
+
+  assert.equal(plan.mode, 'network_search');
+  assert.equal(plan.selectedTool, 'mcp__preferred__search');
+  assert.deepEqual(plan.allowedTools, ['mcp__preferred__search']);
+});
+
+test('selectRecoveryPlan supports configured-only and disabled network tool modes', () => {
+  const input = {
+    messages: [],
+    tools: [{
+      name: 'mcp__searxng__search',
+      description: 'Search the web.',
+      input_schema: { type: 'object' },
+    }],
+  };
+
+  const configuredOnly = selectRecoveryPlan(input, loadConfig({
+    RECOVERY_NETWORK_TOOL_MODE: 'configured-only',
+    RECOVERY_WEB_SEARCH_TOOL_NAMES: '',
+    RECOVERY_WEB_FETCH_TOOL_NAMES: '',
+  }), { kind: 'loop', reason: 'abab_reasoning_loop' });
+  const disabled = selectRecoveryPlan(input, loadConfig({
+    RECOVERY_NETWORK_TOOL_MODE: 'disabled',
+  }), { kind: 'loop', reason: 'abab_reasoning_loop' });
+
+  assert.equal(configuredOnly.mode, 'evidence_fallback');
+  assert.deepEqual(configuredOnly.allowedTools, []);
+  assert.equal(disabled.mode, 'evidence_fallback');
+  assert.deepEqual(disabled.allowedTools, []);
+});
+
+test('applyRequestPolicy restricts multi-candidate network recovery to allowed tools and uses tool_choice any', () => {
+  const config = loadConfig({
+    RECOVERY_NETWORK_TEMPERATURE_MAX: '0.3',
+    RECOVERY_NETWORK_MAX_TOKENS: '1024',
+  });
+  const input = {
+    model: 'claude-sonnet-4-6',
+    temperature: 0.65,
+    max_tokens: 8192,
+    messages: [{ role: 'user', content: 'research' }],
+    tools: [
+      { name: 'Read', input_schema: { type: 'object' } },
+      { name: 'mcp__searxng__search', input_schema: { type: 'object' } },
+      { name: 'mcp__tavily__search', input_schema: { type: 'object' } },
+      { name: 'WebSearch', input_schema: { type: 'object' } },
+    ],
+  };
+  const plan = {
+    mode: 'network_search_choice',
+    selectedTool: null,
+    allowedTools: ['mcp__searxng__search', 'mcp__tavily__search'],
+    instruction: '[RECOVERY CONTROL] Choose exactly one allowed network tool.',
+  };
+
+  const output = applyRequestPolicy(input, config, { recoveryPlan: plan });
+
+  assert.equal(output.model, 'claude-sonnet-4-6');
+  assert.equal(output.temperature, 0.3);
+  assert.equal(output.max_tokens, 1024);
+  assert.deepEqual(output.tools.map((tool) => tool.name), [
+    'mcp__searxng__search',
+    'mcp__tavily__search',
+  ]);
+  assert.deepEqual(output.tool_choice, { type: 'any' });
 });
 
 test('selectRecoveryPlan prefers configured MCP search over built-in WebSearch and WebFetch', () => {

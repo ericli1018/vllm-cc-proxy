@@ -342,6 +342,129 @@ test('loop recovery forces the configured MCP network tool without reopening tas
   assert.equal(events.at(-1).event, 'message_stop');
 });
 
+
+
+test('loop recovery auto-discovers multiple MCP search tools and lets Ornith choose only within that set', async (t) => {
+  let attempts = 0;
+  const captured = [];
+  const cycle = 'Repeat the same unresolved hypothesis without new evidence.\n';
+  const mock = await startMockVllm(async (req, res) => {
+    attempts += 1;
+    captured.push(await readJsonRequest(req));
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (attempts === 1) {
+      res.write(messageStart('claude-sonnet-4-6'));
+      res.write(sse('content_block_start', {
+        type: 'content_block_start', index: 0,
+        content_block: { type: 'thinking', thinking: '' },
+      }));
+      res.write(sse('content_block_delta', {
+        type: 'content_block_delta', index: 0,
+        delta: { type: 'thinking_delta', thinking: cycle + cycle + cycle },
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      if (!res.destroyed) res.end();
+      return;
+    }
+
+    assert.deepEqual(captured[1].tools.map((tool) => tool.name), [
+      'mcp__searxng__search',
+      'mcp__tavily__research',
+    ]);
+    assert.deepEqual(captured[1].tool_choice, { type: 'any' });
+    assert.equal(captured[1].temperature, 0.3);
+    assert.equal(captured[1].max_tokens, 1024);
+    const system = JSON.stringify(captured[1].system);
+    assert.match(system, /Choose exactly one allowed network tool/i);
+    assert.doesNotMatch(system, /Active Outcome/i);
+
+    res.end(messageStart('claude-sonnet-4-6')
+      + toolBlock(0, {
+        id: 'toolu_network', name: 'mcp__tavily__research',
+        chunks: ['{"query":"current vLLM 0.23 behavior"}'],
+      })
+      + endMessage('tool_use'));
+  });
+  const proxy = await startProxy(mock.baseUrl, {
+    RECOVERY_NETWORK_TOOL_MODE: 'auto',
+  });
+  t.after(async () => { await proxy.close(); await mock.close(); });
+
+  const response = await postMessages(proxy.url, {
+    model: 'claude-sonnet-4-6', max_tokens: 8192, temperature: 0.65, stream: true,
+    messages: [{ role: 'user', content: 'Continue the existing task.' }],
+    tools: [
+      { name: 'Read', description: 'Read a local file.', input_schema: { type: 'object' } },
+      {
+        name: 'mcp__searxng__search',
+        description: 'Search the public web with SearXNG for current information.',
+        input_schema: { type: 'object', properties: { query: { type: 'string' } } },
+      },
+      {
+        name: 'mcp__tavily__research',
+        description: 'Research current information on the internet.',
+        input_schema: { type: 'object', properties: { query: { type: 'string' } } },
+      },
+      { name: 'WebSearch', description: 'Search the web.', input_schema: { type: 'object' } },
+    ],
+  });
+  const events = parseSseText(await response.text());
+  const toolStarts = events.filter((event) => event.data.content_block?.type === 'tool_use');
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(toolStarts.map((event) => event.data.content_block.name), ['mcp__tavily__research']);
+  assert.equal(events.filter((event) => event.data.delta?.type === 'text_delta').length, 0);
+  assert.equal(events.at(-1).event, 'message_stop');
+});
+
+test('auto-choice network recovery rejects a tool outside the discovered candidate set', async (t) => {
+  let attempts = 0;
+  const cycle = 'Repeat unresolved reasoning without evidence.\n';
+  const mock = await startMockVllm(async (req, res) => {
+    attempts += 1;
+    await readJsonRequest(req);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (attempts === 1) {
+      res.write(messageStart('claude-sonnet-4-6'));
+      res.write(sse('content_block_start', {
+        type: 'content_block_start', index: 0,
+        content_block: { type: 'thinking', thinking: '' },
+      }));
+      res.write(sse('content_block_delta', {
+        type: 'content_block_delta', index: 0,
+        delta: { type: 'thinking_delta', thinking: cycle + cycle + cycle },
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      if (!res.destroyed) res.end();
+      return;
+    }
+    res.end(messageStart('claude-sonnet-4-6')
+      + toolBlock(0, { id: 'toolu_wrong', name: 'Read', chunks: ['{"file_path":"/tmp/x"}'] })
+      + endMessage('tool_use'));
+  });
+  const proxy = await startProxy(mock.baseUrl, {
+    RECOVERY_NETWORK_TOOL_MODE: 'auto',
+  });
+  t.after(async () => { await proxy.close(); await mock.close(); });
+
+  const response = await postMessages(proxy.url, {
+    model: 'claude-sonnet-4-6', max_tokens: 8192, stream: true,
+    messages: [{ role: 'user', content: 'continue' }],
+    tools: [
+      { name: 'Read', description: 'Read a local file.', input_schema: { type: 'object' } },
+      { name: 'mcp__searxng__search', description: 'Search the web.', input_schema: { type: 'object' } },
+      { name: 'mcp__tavily__research', description: 'Research the internet.', input_schema: { type: 'object' } },
+    ],
+  });
+  const events = parseSseText(await response.text());
+
+  assert.equal(attempts, 2);
+  assert.equal(events.filter((event) => event.data.content_block?.type === 'tool_use').length, 0);
+  assert.equal(events.filter((event) => event.event === 'message_stop').length, 0);
+  assert.equal(events.at(-1).event, 'error');
+  assert.match(events.at(-1).data.error.message, /recovery contract/i);
+});
+
 test('forced network recovery rejects a different tool and exposes no partial recovery output', async (t) => {
   let attempts = 0;
   const cycle = 'Repeat unresolved reasoning without evidence.\n';
